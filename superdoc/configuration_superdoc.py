@@ -73,11 +73,11 @@ class SuperDocConfig(PretrainedConfig):
             The dropout ratio for the classification head.
         global_attn_every_n_layers (`int`, *optional*, defaults to 1):
             Use global (full) attention every N layers. Set to 1 for all global attention (default, backwards
-            compatible). Set to higher values to use sparse attention on other layers.
-        sparse_n_neighbors (`int`, *optional*, defaults to 32):
-            Number of nearest neighbors each token attends to (based on bbox center Euclidean distance).
-            Each token attends to exactly this many spatially nearest tokens, providing consistent memory usage.
-            Recommended values: 32 (balanced), 64 (more context), 16 (minimal).
+            compatible). Set to higher values to use sliding window attention on other layers.
+        sliding_window_size (`int`, *optional*, defaults to 64):
+            Window size for sliding window attention. Each token attends to `window_size` tokens on each side
+            after spatial reordering based on bbox centers. CLS tokens use global attention within their modality.
+            Recommended values: 64 (balanced), 128 (more context), 32 (minimal).
 
     Example:
 
@@ -129,7 +129,7 @@ class SuperDocConfig(PretrainedConfig):
         patch_size=16,
         classifier_dropout=0.0,
         global_attn_every_n_layers=1,
-        sparse_n_neighbors=32,
+        sliding_window_size=64,
         **kwargs,
     ):
         super().__init__(
@@ -166,7 +166,7 @@ class SuperDocConfig(PretrainedConfig):
         self.patch_size = patch_size
         self.classifier_dropout = classifier_dropout
         self.global_attn_every_n_layers = global_attn_every_n_layers
-        self.sparse_n_neighbors = sparse_n_neighbors
+        self.sliding_window_size = sliding_window_size
 
 
 __all__ = ["SuperDocConfig"]

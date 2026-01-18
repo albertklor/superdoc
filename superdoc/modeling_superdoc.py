@@ -7,6 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+# Check for flex_attention availability (PyTorch 2.5+ with CUDA)
+_FLEX_ATTENTION_AVAILABLE = False
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    _FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    flex_attention = None
+    create_block_mask = None
+
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutput,
@@ -235,10 +244,9 @@ class SuperDocSelfAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        sparse_indices=None,
+        block_mask=None,
     ):
         batch_size, seq_length, _ = hidden_states.shape
-        device = hidden_states.device
         query_layer = (
             self.query(hidden_states)
             .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
@@ -255,102 +263,91 @@ class SuperDocSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        if sparse_indices is not None:
-            # TRUE SPARSE ATTENTION: Only compute for k neighbors
-            # sparse_indices: (batch, seq_query, k) where indices[b,i,:] = k neighbors for query i
-            k = sparse_indices.shape[-1]
-
-            # Expand for all heads: (batch, heads, seq_query, k)
-            idx_expanded = sparse_indices.unsqueeze(1).expand(batch_size, self.num_attention_heads, seq_length, k)
-
-            # For gathering, we need indices with shape (batch, heads, seq_query, k, dim)
-            idx_for_gather = idx_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, self.attention_head_size)
-
-            # Gather k keys/values for EACH query position
-            # key_layer: (batch, heads, seq_key, dim)
-            # We want: for each query i, gather keys at positions sparse_indices[i]
-            # Result: (batch, heads, seq_query, k, dim)
-
-            # Method: Use advanced indexing
-            # Create batch and head indices
-            batch_idx = torch.arange(batch_size, device=hidden_states.device).view(-1, 1, 1, 1)
-            head_idx = torch.arange(self.num_attention_heads, device=hidden_states.device).view(1, -1, 1, 1)
-
-            # sparse_indices: (batch, seq_query, k)
-            # Expand to (batch, heads, seq_query, k)
-            sparse_idx = idx_expanded
-
-            # Gather: key_layer[batch, head, sparse_idx[batch, head, query, :], :]
-            # This requires expanding to proper broadcast shape
-            sparse_keys = key_layer[
-                batch_idx,
-                head_idx,
-                sparse_idx,  # (batch, heads, seq_query, k)
-                :  # all dimensions
-            ]  # Result: (batch, heads, seq_query, k, dim)
-
-            sparse_values = value_layer[
-                batch_idx,
-                head_idx,
-                sparse_idx,
-                :
-            ]
-
-            # Compute attention scores: (batch, heads, seq, k)
-            query_scaled = query_layer / math.sqrt(self.attention_head_size)
-            attention_scores = torch.matmul(
-                query_scaled.unsqueeze(-2),  # (batch, heads, seq, 1, dim)
-                sparse_keys.transpose(-2, -1)  # (batch, heads, seq, dim, k)
-            ).squeeze(-2)  # (batch, heads, seq, k)
-
-            # Gather relative embeddings for k positions
-            # rel_pos: (batch, heads, seq_query, seq_key)
-            # idx_expanded: (batch, heads, seq, k)
-            # Want: for each query i, gather rel_pos[:,:,i,idx_expanded[:,:,i,:]]
+        # Add relative position biases to create combined attention bias
+        attention_bias = None
+        if self.has_relative_attention_bias or self.has_spatial_attention_bias:
+            attention_bias = torch.zeros(batch_size, self.num_attention_heads, seq_length, seq_length,
+                                         device=hidden_states.device, dtype=hidden_states.dtype)
             if self.has_relative_attention_bias and rel_pos is not None:
-                # Use gather on last dimension
-                # idx_expanded already has shape (batch, heads, seq, k)
-                # Just need to match rel_pos dimensions
-                sparse_rel_pos = torch.gather(
-                    rel_pos,  # (batch, heads, seq, seq)
-                    dim=3,  # gather from last dim (seq_key)
-                    index=idx_expanded  # (batch, heads, seq, k)
-                )  # Result: (batch, heads, seq, k)
-                attention_scores += sparse_rel_pos / math.sqrt(self.attention_head_size)
-
+                attention_bias = attention_bias + rel_pos
             if self.has_spatial_attention_bias and rel_2d_pos is not None:
-                sparse_rel_2d_pos = torch.gather(
-                    rel_2d_pos,  # (batch, heads, seq, seq)
-                    dim=3,
-                    index=idx_expanded  # (batch, heads, seq, k)
+                attention_bias = attention_bias + rel_2d_pos
+
+        # Try to use flex_attention for TRUE sparse computation (CUDA only)
+        # This achieves O(N*W) complexity instead of O(N²)
+        use_flex_attention = (
+            _FLEX_ATTENTION_AVAILABLE and
+            block_mask is not None and
+            hidden_states.device.type == 'cuda' and
+            not output_attentions  # flex_attention doesn't return attention weights
+        )
+
+        if use_flex_attention:
+            # Create score_mod function to add relative position biases
+            if attention_bias is not None:
+                # Capture the bias tensor in a closure for score_mod
+                bias_tensor = attention_bias
+
+                def score_mod(score, b, h, q_idx, kv_idx):
+                    return score + bias_tensor[b, h, q_idx, kv_idx]
+            else:
+                score_mod = None
+
+            try:
+                # Use flex_attention with block-sparse mask for TRUE O(N*W) computation
+                context_layer = flex_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    score_mod=score_mod,
+                    block_mask=block_mask,
+                    scale=1.0 / math.sqrt(self.attention_head_size),
                 )
-                attention_scores += sparse_rel_2d_pos / math.sqrt(self.attention_head_size)
+                attention_probs = None
+            except Exception as e:
+                # Fall back to dense attention if flex_attention fails
+                logger.warning(f"flex_attention failed: {e}. Falling back to dense attention.")
+                use_flex_attention = False
 
-            # Apply softmax (use cogview for stability, same as full attention)
-            attention_probs = self.cogview_attention(attention_scores)
-            attention_probs = self.dropout(attention_probs)
-
-            # Compute context: (batch, heads, seq, dim)
-            context_layer = torch.matmul(
-                attention_probs.unsqueeze(-2),  # (batch, heads, seq, 1, k)
-                sparse_values  # (batch, heads, seq, k, dim)
-            ).squeeze(-2)
-
-        else:
-            # FULL ATTENTION (original)
-            attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
-
-            if self.has_relative_attention_bias and self.has_spatial_attention_bias:
-                attention_scores += (rel_pos + rel_2d_pos) / math.sqrt(self.attention_head_size)
-            elif self.has_relative_attention_bias:
-                attention_scores += rel_pos / math.sqrt(self.attention_head_size)
-
+        if not use_flex_attention:
+            # Combine attention mask with bias for dense attention
             if attention_mask is not None:
-                attention_scores = attention_scores + attention_mask
+                if attention_bias is not None:
+                    attention_bias = attention_bias + attention_mask
+                else:
+                    attention_bias = attention_mask
 
-            attention_probs = self.cogview_attention(attention_scores)
-            attention_probs = self.dropout(attention_probs)
-            context_layer = torch.matmul(attention_probs, value_layer)
+            # Use scaled_dot_product_attention for memory efficiency when not outputting attentions
+            # This uses Flash Attention or Memory-Efficient Attention when available
+            if not output_attentions and attention_bias is not None:
+                context_layer = F.scaled_dot_product_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    attn_mask=attention_bias,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    scale=1.0 / math.sqrt(self.attention_head_size),
+                )
+                attention_probs = None
+            elif not output_attentions and attention_bias is None:
+                context_layer = F.scaled_dot_product_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    scale=1.0 / math.sqrt(self.attention_head_size),
+                )
+                attention_probs = None
+            else:
+                # Fallback to manual computation when we need attention weights
+                attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
+
+                if attention_bias is not None:
+                    attention_scores = attention_scores + attention_bias
+
+                attention_probs = self.cogview_attention(attention_scores)
+                attention_probs = self.dropout(attention_probs)
+                context_layer = torch.matmul(attention_probs, value_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -390,7 +387,7 @@ class SuperDocAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        sparse_indices=None,
+        block_mask=None,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -398,7 +395,7 @@ class SuperDocAttention(nn.Module):
             output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
-            sparse_indices=sparse_indices,
+            block_mask=block_mask,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -422,7 +419,7 @@ class SuperDocLayer(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        sparse_indices=None,
+        block_mask=None,
     ):
         self_attention_outputs = self.attention(
             hidden_states,
@@ -430,7 +427,7 @@ class SuperDocLayer(nn.Module):
             output_attentions=output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
-            sparse_indices=sparse_indices,
+            block_mask=block_mask,
         )
         attention_output = self_attention_outputs[0]
 
@@ -459,9 +456,9 @@ class SuperDocEncoder(nn.Module):
         self.has_relative_attention_bias = config.has_relative_attention_bias
         self.has_spatial_attention_bias = config.has_spatial_attention_bias
 
-        # Sparse attention parameters
+        # Sliding window attention parameters
         self.global_attn_every_n_layers = config.global_attn_every_n_layers
-        self.sparse_n_neighbors = config.sparse_n_neighbors
+        self.sliding_window_size = config.sliding_window_size
 
         if self.has_relative_attention_bias:
             self.rel_pos_bins = config.rel_pos_bins
@@ -474,35 +471,179 @@ class SuperDocEncoder(nn.Module):
             self.rel_pos_x_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
             self.rel_pos_y_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
 
-    def _compute_sparse_attention_indices(self, bbox, text_seq_len=None):
+    def _compute_spatial_sort_order(self, bbox, text_seq_len=None):
         """
-        Compute k-nearest neighbor indices for TRUE sparse attention.
-        Returns: (batch, seq, k) tensor of indices for each token's neighbors.
+        Compute sort order based on bbox centers for sliding window attention.
+        Sorts tokens in reading order (top-to-bottom, left-to-right).
+
+        IMPORTANT: CLS tokens are kept at fixed positions:
+        - Text CLS stays at position 0
+        - Visual CLS stays at position text_seq_len
+        Only content tokens within each modality are sorted.
+
+        Returns:
+            sort_indices: (batch, seq) indices to sort tokens by spatial position
+            unsort_indices: (batch, seq) indices to restore original order
         """
         batch_size, seq_len = bbox.shape[:2]
         device = bbox.device
 
         with torch.no_grad():
+            # Start with identity mapping
+            sort_indices = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1).clone()
+
             # Compute bbox centers
-            center_x = (bbox[:, :, 0] + bbox[:, :, 2]) / 2.0
-            center_y = (bbox[:, :, 1] + bbox[:, :, 3]) / 2.0
-            centers = torch.stack([center_x, center_y], dim=-1)  # (batch, seq, 2)
+            center_x = (bbox[:, :, 0] + bbox[:, :, 2]) / 2.0  # (batch, seq)
+            center_y = (bbox[:, :, 1] + bbox[:, :, 3]) / 2.0  # (batch, seq)
 
             # Identify padding tokens (bbox=[0,0,0,0])
-            is_pad = (bbox == 0).all(dim=-1)
+            is_pad = (bbox == 0).all(dim=-1)  # (batch, seq)
 
-            # Compute pairwise squared Euclidean distances
-            distances = torch.cdist(centers, centers, p=2).pow_(2)  # (batch, seq, seq)
+            # Create sort key: (y_center * 10000 + x_center) for reading order
+            sort_key = center_y * 10000 + center_x  # (batch, seq)
+            # Padding tokens get max value to stay at the end of their section
+            sort_key = sort_key.masked_fill(is_pad, float('inf'))
 
-            # Set distance to and from padding tokens as infinity
-            distances.masked_fill_(is_pad.unsqueeze(1), float('inf'))
-            distances.masked_fill_(is_pad.unsqueeze(2), float('inf'))
+            if text_seq_len is None or text_seq_len == 0:
+                # Visual-only mode: CLS at position 0, sort content tokens (positions 1+)
+                if seq_len > 1:
+                    visual_content_keys = sort_key[:, 1:]  # (batch, seq_len-1)
+                    visual_content_order = torch.argsort(visual_content_keys, dim=-1)
+                    sort_indices[:, 1:] = visual_content_order + 1
+            else:
+                if text_seq_len > 1:
+                    # Sort text content tokens (positions 1 to text_seq_len-1), keep CLS at 0
+                    text_content_keys = sort_key[:, 1:text_seq_len]  # (batch, text_seq_len-1)
+                    text_content_order = torch.argsort(text_content_keys, dim=-1)  # relative indices
+                    # Convert to absolute indices (add 1 since we skipped position 0)
+                    sort_indices[:, 1:text_seq_len] = text_content_order + 1
 
-            # For each token, find the N nearest neighbors
-            n_neighbors = min(self.sparse_n_neighbors, seq_len)
-            _, nearest_indices = torch.topk(distances, k=n_neighbors, dim=-1, largest=False)
+                if text_seq_len < seq_len - 1:
+                    # Sort visual content tokens (positions text_seq_len+1 to end), keep visual CLS at text_seq_len
+                    visual_content_keys = sort_key[:, text_seq_len + 1:]  # (batch, num_visual_content)
+                    visual_content_order = torch.argsort(visual_content_keys, dim=-1)  # relative indices
+                    # Convert to absolute indices
+                    sort_indices[:, text_seq_len + 1:] = visual_content_order + text_seq_len + 1
 
-        return nearest_indices.detach()  # (batch, seq, k)
+            # Compute inverse permutation (unsort indices)
+            unsort_indices = torch.argsort(sort_indices, dim=-1)  # (batch, seq)
+
+        return sort_indices.detach(), unsort_indices.detach()
+
+    def _create_sliding_window_mask(self, seq_len, window_size, text_seq_len, device, dtype, padding_mask=None):
+        """
+        Create sliding window attention mask with global attention for CLS tokens.
+
+        Args:
+            seq_len: total sequence length
+            window_size: number of tokens to attend to on each side
+            text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
+            device: torch device
+            dtype: torch dtype for mask values
+            padding_mask: (batch, seq_len) tensor where True = padding token
+
+        Returns:
+            attention_mask: (batch, 1, seq_len, seq_len) mask with 0 for attend, -inf for masked
+        """
+        # Start with all masked
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device, dtype=dtype)
+
+        # Create sliding window for all content tokens (allows cross-modality at boundary)
+        for i in range(seq_len):
+            start = max(0, i - window_size)
+            end = min(seq_len, i + window_size + 1)
+            mask[i, start:end] = 0.0
+
+        if text_seq_len is None or text_seq_len == 0:
+            # Visual-only mode: CLS is at position 0, all tokens are visual
+            mask[0, :] = 0.0  # Visual CLS attends to all tokens
+            mask[:, 0] = 0.0  # All tokens attend to visual CLS
+        elif text_seq_len > 0:
+            # Text CLS token (position 0): global attention to ALL text, NOT visual
+            # First, ensure CLS row only attends to text (override sliding window)
+            mask[0, :] = float('-inf')  # Reset row
+            mask[0, :text_seq_len] = 0.0  # Text CLS attends to all text only
+            # All text tokens attend to text CLS (column 0 for text rows)
+            mask[:text_seq_len, 0] = 0.0
+
+            # Visual CLS token (position text_seq_len): global attention to ALL visual, NOT text
+            if text_seq_len < seq_len:
+                visual_start = text_seq_len
+                # Reset visual CLS row and set only visual attention
+                mask[visual_start, :] = float('-inf')
+                mask[visual_start, visual_start:] = 0.0  # Visual CLS attends to all visual only
+                # All visual tokens attend to visual CLS
+                mask[visual_start:, visual_start] = 0.0
+
+        # Expand for batch and head dimensions: (1, 1, seq_len, seq_len)
+        mask = mask.unsqueeze(0).unsqueeze(0)
+
+        # Incorporate padding mask if provided
+        if padding_mask is not None:
+            # padding_mask: (batch, seq_len) where True = padding
+            # Expand to (batch, 1, 1, seq_len) for broadcasting
+            padding_mask_expanded = padding_mask.unsqueeze(1).unsqueeze(2)
+            # Set attention to padding tokens to -inf
+            mask = mask.expand(padding_mask.shape[0], -1, -1, -1).clone()
+            mask.masked_fill_(padding_mask_expanded, float('-inf'))
+
+        return mask
+
+    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, device, padding_mask=None):
+        """
+        Create a BlockMask for flex_attention with sliding window pattern.
+
+        This enables TRUE sparse attention computation (O(N*W) instead of O(N²))
+        when running on CUDA with flex_attention.
+
+        Args:
+            seq_len: total sequence length
+            window_size: number of tokens to attend to on each side
+            text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
+            device: torch device (must be CUDA for flex_attention)
+            padding_mask: (batch, seq_len) tensor where True = padding token
+
+        Returns:
+            BlockMask for flex_attention, or None if flex_attention unavailable
+        """
+        if not _FLEX_ATTENTION_AVAILABLE or not device.type == 'cuda':
+            return None
+
+        # Define the mask_mod function for sliding window + CLS global attention
+        def sliding_window_with_cls(b, h, q_idx, kv_idx):
+            # Sliding window: attend if within window_size
+            in_window = torch.abs(q_idx - kv_idx) <= window_size
+
+            if text_seq_len is None or text_seq_len == 0:
+                # Visual-only mode: CLS at position 0 has global attention
+                is_cls = (q_idx == 0) | (kv_idx == 0)
+                return in_window | is_cls
+            else:
+                # Text CLS (pos 0): global attention to text only
+                text_cls_query = (q_idx == 0) & (kv_idx < text_seq_len)
+                text_cls_key = (kv_idx == 0) & (q_idx < text_seq_len)
+
+                # Visual CLS (pos text_seq_len): global attention to visual only
+                visual_cls_query = (q_idx == text_seq_len) & (kv_idx >= text_seq_len)
+                visual_cls_key = (kv_idx == text_seq_len) & (q_idx >= text_seq_len)
+
+                return in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
+
+        try:
+            # Create block mask - B and H are None to broadcast across batch/heads
+            block_mask = create_block_mask(
+                sliding_window_with_cls,
+                B=None,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+                _compile=True,  # Compile for better performance
+            )
+            return block_mask
+        except Exception as e:
+            logger.warning(f"Failed to create flex_attention block_mask: {e}. Falling back to dense mask.")
+            return None
 
     def relative_position_bucket(self, relative_position, bidirectional=True, num_buckets=32, max_distance=128):
         ret = 0
@@ -587,43 +728,118 @@ class SuperDocEncoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        rel_pos = self._cal_1d_pos_emb(position_ids) if self.has_relative_attention_bias else None
-        rel_2d_pos = self._cal_2d_pos_emb(bbox) if self.has_spatial_attention_bias else None
+        # Determine if we should use sliding window attention
+        use_sliding_window = self.global_attn_every_n_layers > 1 and bbox is not None
 
-        # Compute sparse attention indices once if using sparse attention
-        use_sparse_attn = self.global_attn_every_n_layers > 1 and bbox is not None
-        sparse_indices = None
-        if use_sparse_attn:
-            sparse_indices = self._compute_sparse_attention_indices(
+        # Reorder tokens ONCE at the beginning if using sliding window
+        unsort_indices = None
+        if use_sliding_window:
+            batch_size = hidden_states.shape[0]
+            batch_idx = torch.arange(batch_size, device=hidden_states.device).unsqueeze(1)
+
+            # Compute spatial sort order based on bbox centers
+            sort_indices, unsort_indices = self._compute_spatial_sort_order(
                 bbox=bbox,
                 text_seq_len=text_seq_len,
             )
 
+            # Reorder hidden states
+            hidden_states = hidden_states[batch_idx, sort_indices]
+
+            # Reorder bbox for relative position computation
+            bbox = bbox[batch_idx, sort_indices]
+
+            # Reorder position_ids
+            position_ids = position_ids[batch_idx, sort_indices]
+
+            # Reorder attention mask if present
+            if attention_mask is not None:
+                # attention_mask is extended: (batch, 1, 1, seq) or (batch, 1, seq, seq)
+                if attention_mask.dim() == 4 and attention_mask.shape[2] == 1:
+                    # (batch, 1, 1, seq) - reorder last dim using gather
+                    # sort_indices: (batch, seq)
+                    # We need to gather along the last dimension
+                    attention_mask = torch.gather(
+                        attention_mask,
+                        dim=3,
+                        index=sort_indices.unsqueeze(1).unsqueeze(1)  # (batch, 1, 1, seq)
+                    )
+                elif attention_mask.dim() == 4:
+                    # (batch, 1, seq, seq) - this is rare, but handle it
+                    # For now, we'll skip reordering this complex case and just
+                    # rely on the sliding_mask for attention pattern
+                    pass
+
+            # Create sliding window mask (with CLS global attention and padding)
+            seq_len = hidden_states.shape[1]
+            # Identify padding tokens from reordered bbox
+            padding_mask = (bbox == 0).all(dim=-1)  # (batch, seq)
+
+            # Try to create flex_attention BlockMask for TRUE sparse attention (CUDA only)
+            flex_block_mask = self._create_flex_block_mask(
+                seq_len=seq_len,
+                window_size=self.sliding_window_size,
+                text_seq_len=text_seq_len,
+                device=hidden_states.device,
+                padding_mask=padding_mask,
+            )
+
+            # Create dense fallback mask (used on CPU or when flex_attention fails)
+            sliding_mask = self._create_sliding_window_mask(
+                seq_len=seq_len,
+                window_size=self.sliding_window_size,
+                text_seq_len=text_seq_len,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+                padding_mask=padding_mask,
+            )
+        else:
+            flex_block_mask = None
+
+        # Compute relative position embeddings on the (possibly reordered) sequence
+        rel_pos = self._cal_1d_pos_emb(position_ids) if self.has_relative_attention_bias else None
+        rel_2d_pos = self._cal_2d_pos_emb(bbox) if self.has_spatial_attention_bias else None
+
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+                # Store hidden states in original (unsorted) order for consistency
+                if unsort_indices is not None:
+                    batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device).unsqueeze(1)
+                    all_hidden_states = all_hidden_states + (hidden_states[batch_idx, unsort_indices],)
+                else:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # Determine whether to use sparse attention for this layer
+            # Determine whether to use sliding window attention for this layer
+            # Use global attention if: (1) config says all layers are global, (2) this is a global layer,
+            # or (3) sliding window wasn't set up (e.g., bbox is None)
             use_global_attn = (
+                not use_sliding_window or
                 self.global_attn_every_n_layers == 1 or
                 (i + 1) % self.global_attn_every_n_layers == 0
             )
 
-            # Pass sparse_indices for sparse layers, None for full attention layers
-            layer_sparse_indices = None if use_global_attn else sparse_indices
+            # Choose mask: sliding window or full attention
+            layer_mask = attention_mask if use_global_attn else sliding_mask
+            # Use flex_attention block_mask for sliding window layers (enables TRUE sparse attention)
+            layer_block_mask = None if use_global_attn else flex_block_mask
 
             layer_outputs = layer_module(
                 hidden_states,
-                attention_mask,
+                layer_mask,
                 output_attentions,
                 rel_pos=rel_pos,
                 rel_2d_pos=rel_2d_pos,
-                sparse_indices=layer_sparse_indices,
+                block_mask=layer_block_mask,
             )
-
             hidden_states = layer_outputs[0]
+
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+        # Reorder back to original positions at the end
+        if unsort_indices is not None:
+            batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device).unsqueeze(1)
+            hidden_states = hidden_states[batch_idx, unsort_indices]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
