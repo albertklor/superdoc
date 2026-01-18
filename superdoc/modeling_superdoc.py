@@ -589,9 +589,9 @@ class SuperDocEncoder(nn.Module):
 
         return mask
 
-    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, device, padding_mask=None):
+    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, batch_size, device, padding_mask=None):
         """
-        Create a BlockMask for flex_attention with sliding window pattern.
+        Create a BlockMask for flex_attention with sliding window pattern and padding support.
 
         This enables TRUE sparse attention computation (O(N*W) instead of O(N²))
         when running on CUDA with flex_attention.
@@ -600,24 +600,28 @@ class SuperDocEncoder(nn.Module):
             seq_len: total sequence length
             window_size: number of tokens to attend to on each side
             text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
+            batch_size: batch size (needed for per-batch padding masks)
             device: torch device (must be CUDA for flex_attention)
             padding_mask: (batch, seq_len) tensor where True = padding token
 
         Returns:
             BlockMask for flex_attention, or None if flex_attention unavailable
         """
-        if not _FLEX_ATTENTION_AVAILABLE or not device.type == 'cuda':
+        if not _FLEX_ATTENTION_AVAILABLE or device.type != 'cuda':
             return None
 
-        # Define the mask_mod function for sliding window + CLS global attention
-        def sliding_window_with_cls(b, h, q_idx, kv_idx):
+        # Capture padding_mask for use in mask_mod
+        _padding_mask = padding_mask
+
+        # Define the mask_mod function for sliding window + CLS global attention + padding
+        def sliding_window_with_cls_and_padding(b, h, q_idx, kv_idx):
             # Sliding window: attend if within window_size
             in_window = torch.abs(q_idx - kv_idx) <= window_size
 
             if text_seq_len is None or text_seq_len == 0:
                 # Visual-only mode: CLS at position 0 has global attention
                 is_cls = (q_idx == 0) | (kv_idx == 0)
-                return in_window | is_cls
+                attend = in_window | is_cls
             else:
                 # Text CLS (pos 0): global attention to text only
                 text_cls_query = (q_idx == 0) & (kv_idx < text_seq_len)
@@ -627,18 +631,24 @@ class SuperDocEncoder(nn.Module):
                 visual_cls_query = (q_idx == text_seq_len) & (kv_idx >= text_seq_len)
                 visual_cls_key = (kv_idx == text_seq_len) & (q_idx >= text_seq_len)
 
-                return in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
+                attend = in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
+
+            # Mask out padding tokens (don't attend to padding)
+            if _padding_mask is not None:
+                is_kv_padding = _padding_mask[b, kv_idx]
+                attend = attend & ~is_kv_padding
+
+            return attend
 
         try:
-            # Create block mask - B and H are None to broadcast across batch/heads
+            # Create block mask with batch dimension for per-batch padding support
             block_mask = create_block_mask(
-                sliding_window_with_cls,
-                B=None,
-                H=None,
+                sliding_window_with_cls_and_padding,
+                B=batch_size,
+                H=None,  # Broadcast across heads
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
                 device=device,
-                _compile=True,  # Compile for better performance
             )
             return block_mask
         except Exception as e:
@@ -780,6 +790,7 @@ class SuperDocEncoder(nn.Module):
                 seq_len=seq_len,
                 window_size=self.sliding_window_size,
                 text_seq_len=text_seq_len,
+                batch_size=batch_size,
                 device=hidden_states.device,
                 padding_mask=padding_mask,
             )
