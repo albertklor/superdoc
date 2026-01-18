@@ -7,15 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-# Check for flex_attention availability (PyTorch 2.5+ with CUDA)
-_FLEX_ATTENTION_AVAILABLE = False
-try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    _FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    flex_attention = None
-    create_block_mask = None
-
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutput,
@@ -244,7 +235,6 @@ class SuperDocSelfAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        block_mask=None,
     ):
         batch_size, seq_length, _ = hidden_states.shape
         query_layer = (
@@ -273,60 +263,12 @@ class SuperDocSelfAttention(nn.Module):
             if self.has_spatial_attention_bias and rel_2d_pos is not None:
                 attention_bias = attention_bias + rel_2d_pos
 
-        # Try to use flex_attention for TRUE sparse computation (CUDA only)
-        # This achieves O(N*W) complexity instead of O(N²)
-        use_flex_attention = (
-            _FLEX_ATTENTION_AVAILABLE and
-            block_mask is not None and
-            hidden_states.device.type == 'cuda' and
-            not output_attentions  # flex_attention doesn't return attention weights
-        )
-
-        if use_flex_attention:
-            # Create score_mod function to add relative position biases AND padding mask
-            # Both need to be handled in score_mod since block_mask is static (B=None for torch.compile)
-            has_bias = attention_bias is not None
-            has_mask = attention_mask is not None
-
-            if has_bias or has_mask:
-                # Capture tensors in closure for score_mod
-                bias_tensor = attention_bias
-                mask_tensor = attention_mask
-
-                def score_mod(score, b, h, q_idx, kv_idx):
-                    result = score
-                    if has_bias:
-                        result = result + bias_tensor[b, h, q_idx, kv_idx]
-                    if has_mask:
-                        # attention_mask shape is [B, 1, 1, seq_len] or [B, 1, seq_len, seq_len]
-                        # We need to index based on kv_idx (the key position being masked)
-                        if mask_tensor.dim() == 4 and mask_tensor.shape[2] == 1:
-                            # Shape [B, 1, 1, seq_len] - broadcast over q_idx
-                            result = result + mask_tensor[b, 0, 0, kv_idx]
-                        else:
-                            # Shape [B, 1, seq_len, seq_len] or similar
-                            result = result + mask_tensor[b, 0, q_idx, kv_idx]
-                    return result
-            else:
-                score_mod = None
-
-            try:
-                # Use flex_attention with block-sparse mask for TRUE O(N*W) computation
-                context_layer = flex_attention(
-                    query_layer,
-                    key_layer,
-                    value_layer,
-                    score_mod=score_mod,
-                    block_mask=block_mask,
-                    scale=1.0 / math.sqrt(self.attention_head_size),
-                )
-                attention_probs = None
-            except Exception as e:
-                # Fall back to dense attention if flex_attention fails
-                logger.warning(f"flex_attention failed: {e}. Falling back to dense attention.")
-                use_flex_attention = False
-
-        if not use_flex_attention:
+        # NOTE: flex_attention with score_mod is incompatible with torch.compile
+        # because captured tensors in score_mod closures can't be traced properly.
+        # We use scaled_dot_product_attention instead, which still benefits from
+        # Flash Attention kernels while supporting relative position biases and padding.
+        # The sliding window pattern is applied via the dense attention mask.
+        if True:  # Dense attention path
             # Combine attention mask with bias for dense attention
             if attention_mask is not None:
                 if attention_bias is not None:
@@ -404,7 +346,6 @@ class SuperDocAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        block_mask=None,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -412,7 +353,6 @@ class SuperDocAttention(nn.Module):
             output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
-            block_mask=block_mask,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -436,7 +376,6 @@ class SuperDocLayer(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
-        block_mask=None,
     ):
         self_attention_outputs = self.attention(
             hidden_states,
@@ -444,7 +383,6 @@ class SuperDocLayer(nn.Module):
             output_attentions=output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
-            block_mask=block_mask,
         )
         attention_output = self_attention_outputs[0]
 
@@ -606,66 +544,6 @@ class SuperDocEncoder(nn.Module):
 
         return mask
 
-    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, device):
-        """
-        Create a BlockMask for flex_attention with sliding window pattern.
-
-        This enables TRUE sparse attention computation (O(N*W) instead of O(N²))
-        when running on CUDA with flex_attention.
-
-        Note: Padding is handled via score_mod in the attention layer, not here.
-        This allows the block_mask to be static (B=None) which is more compatible
-        with torch.compile.
-
-        Args:
-            seq_len: total sequence length
-            window_size: number of tokens to attend to on each side
-            text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
-            device: torch device (must be CUDA for flex_attention)
-
-        Returns:
-            BlockMask for flex_attention, or None if flex_attention unavailable
-        """
-        if not _FLEX_ATTENTION_AVAILABLE or device.type != 'cuda':
-            return None
-
-        # Define the mask_mod function for sliding window + CLS global attention
-        # Padding is handled separately via score_mod for torch.compile compatibility
-        def sliding_window_with_cls(b, h, q_idx, kv_idx):
-            # Sliding window: attend if within window_size
-            in_window = torch.abs(q_idx - kv_idx) <= window_size
-
-            if text_seq_len is None or text_seq_len == 0:
-                # Visual-only mode: CLS at position 0 has global attention
-                is_cls = (q_idx == 0) | (kv_idx == 0)
-                return in_window | is_cls
-            else:
-                # Text CLS (pos 0): global attention to text only
-                text_cls_query = (q_idx == 0) & (kv_idx < text_seq_len)
-                text_cls_key = (kv_idx == 0) & (q_idx < text_seq_len)
-
-                # Visual CLS (pos text_seq_len): global attention to visual only
-                visual_cls_query = (q_idx == text_seq_len) & (kv_idx >= text_seq_len)
-                visual_cls_key = (kv_idx == text_seq_len) & (q_idx >= text_seq_len)
-
-                return in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
-
-        try:
-            # Create block mask with B=None for static pattern (broadcasts across batch)
-            # This is more compatible with torch.compile
-            block_mask = create_block_mask(
-                sliding_window_with_cls,
-                B=None,
-                H=None,
-                Q_LEN=seq_len,
-                KV_LEN=seq_len,
-                device=device,
-            )
-            return block_mask
-        except Exception as e:
-            logger.warning(f"Failed to create flex_attention block_mask: {e}. Falling back to dense mask.")
-            return None
-
     def relative_position_bucket(self, relative_position, bidirectional=True, num_buckets=32, max_distance=128):
         ret = 0
         if bidirectional:
@@ -796,16 +674,11 @@ class SuperDocEncoder(nn.Module):
             # Identify padding tokens from reordered bbox
             padding_mask = (bbox == 0).all(dim=-1)  # (batch, seq)
 
-            # Try to create flex_attention BlockMask for TRUE sparse attention (CUDA only)
-            # Padding is handled via score_mod in attention, not in block_mask
-            flex_block_mask = self._create_flex_block_mask(
-                seq_len=seq_len,
-                window_size=self.sliding_window_size,
-                text_seq_len=text_seq_len,
-                device=hidden_states.device,
-            )
+            # NOTE: flex_attention is disabled because score_mod with captured tensors
+            # is incompatible with torch.compile. We use scaled_dot_product_attention
+            # with a dense sliding window mask instead.
 
-            # Create dense fallback mask (used on CPU or when flex_attention fails)
+            # Create sliding window mask (with padding)
             sliding_mask = self._create_sliding_window_mask(
                 seq_len=seq_len,
                 window_size=self.sliding_window_size,
@@ -814,8 +687,6 @@ class SuperDocEncoder(nn.Module):
                 dtype=hidden_states.dtype,
                 padding_mask=padding_mask,
             )
-        else:
-            flex_block_mask = None
 
         # Compute relative position embeddings on the (possibly reordered) sequence
         rel_pos = self._cal_1d_pos_emb(position_ids) if self.has_relative_attention_bias else None
@@ -841,8 +712,6 @@ class SuperDocEncoder(nn.Module):
 
             # Choose mask: sliding window or full attention
             layer_mask = attention_mask if use_global_attn else sliding_mask
-            # Use flex_attention block_mask for sliding window layers (enables TRUE sparse attention)
-            layer_block_mask = None if use_global_attn else flex_block_mask
 
             layer_outputs = layer_module(
                 hidden_states,
@@ -850,7 +719,6 @@ class SuperDocEncoder(nn.Module):
                 output_attentions,
                 rel_pos=rel_pos,
                 rel_2d_pos=rel_2d_pos,
-                block_mask=layer_block_mask,
             )
             hidden_states = layer_outputs[0]
 
