@@ -235,8 +235,10 @@ class SuperDocSelfAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
+        sparse_indices=None,
     ):
         batch_size, seq_length, _ = hidden_states.shape
+        device = hidden_states.device
         query_layer = (
             self.query(hidden_states)
             .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
@@ -253,29 +255,102 @@ class SuperDocSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        # The attention scores QT K/√d could be significantly larger than input elements, and result in overflow.
-        # Changing the computational order into QT(K/√d) alleviates the problem. (https://huggingface.co/papers/2105.13290)
-        attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
+        if sparse_indices is not None:
+            # TRUE SPARSE ATTENTION: Only compute for k neighbors
+            # sparse_indices: (batch, seq_query, k) where indices[b,i,:] = k neighbors for query i
+            k = sparse_indices.shape[-1]
 
-        if self.has_relative_attention_bias and self.has_spatial_attention_bias:
-            attention_scores += (rel_pos + rel_2d_pos) / math.sqrt(self.attention_head_size)
-        elif self.has_relative_attention_bias:
-            attention_scores += rel_pos / math.sqrt(self.attention_head_size)
+            # Expand for all heads: (batch, heads, seq_query, k)
+            idx_expanded = sparse_indices.unsqueeze(1).expand(batch_size, self.num_attention_heads, seq_length, k)
 
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in RobertaModel forward() function)
-            attention_scores = attention_scores + attention_mask
+            # For gathering, we need indices with shape (batch, heads, seq_query, k, dim)
+            idx_for_gather = idx_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, self.attention_head_size)
 
-        # Normalize the attention scores to probabilities.
-        # Use the trick of the CogView paper to stabilize training
-        attention_probs = self.cogview_attention(attention_scores)
+            # Gather k keys/values for EACH query position
+            # key_layer: (batch, heads, seq_key, dim)
+            # We want: for each query i, gather keys at positions sparse_indices[i]
+            # Result: (batch, heads, seq_query, k, dim)
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
+            # Method: Use advanced indexing
+            # Create batch and head indices
+            batch_idx = torch.arange(batch_size, device=hidden_states.device).view(-1, 1, 1, 1)
+            head_idx = torch.arange(self.num_attention_heads, device=hidden_states.device).view(1, -1, 1, 1)
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+            # sparse_indices: (batch, seq_query, k)
+            # Expand to (batch, heads, seq_query, k)
+            sparse_idx = idx_expanded
+
+            # Gather: key_layer[batch, head, sparse_idx[batch, head, query, :], :]
+            # This requires expanding to proper broadcast shape
+            sparse_keys = key_layer[
+                batch_idx,
+                head_idx,
+                sparse_idx,  # (batch, heads, seq_query, k)
+                :  # all dimensions
+            ]  # Result: (batch, heads, seq_query, k, dim)
+
+            sparse_values = value_layer[
+                batch_idx,
+                head_idx,
+                sparse_idx,
+                :
+            ]
+
+            # Compute attention scores: (batch, heads, seq, k)
+            query_scaled = query_layer / math.sqrt(self.attention_head_size)
+            attention_scores = torch.matmul(
+                query_scaled.unsqueeze(-2),  # (batch, heads, seq, 1, dim)
+                sparse_keys.transpose(-2, -1)  # (batch, heads, seq, dim, k)
+            ).squeeze(-2)  # (batch, heads, seq, k)
+
+            # Gather relative embeddings for k positions
+            # rel_pos: (batch, heads, seq_query, seq_key)
+            # idx_expanded: (batch, heads, seq, k)
+            # Want: for each query i, gather rel_pos[:,:,i,idx_expanded[:,:,i,:]]
+            if self.has_relative_attention_bias and rel_pos is not None:
+                # Use gather on last dimension
+                # idx_expanded already has shape (batch, heads, seq, k)
+                # Just need to match rel_pos dimensions
+                sparse_rel_pos = torch.gather(
+                    rel_pos,  # (batch, heads, seq, seq)
+                    dim=3,  # gather from last dim (seq_key)
+                    index=idx_expanded  # (batch, heads, seq, k)
+                )  # Result: (batch, heads, seq, k)
+                attention_scores += sparse_rel_pos / math.sqrt(self.attention_head_size)
+
+            if self.has_spatial_attention_bias and rel_2d_pos is not None:
+                sparse_rel_2d_pos = torch.gather(
+                    rel_2d_pos,  # (batch, heads, seq, seq)
+                    dim=3,
+                    index=idx_expanded  # (batch, heads, seq, k)
+                )
+                attention_scores += sparse_rel_2d_pos / math.sqrt(self.attention_head_size)
+
+            # Apply softmax (use cogview for stability, same as full attention)
+            attention_probs = self.cogview_attention(attention_scores)
+            attention_probs = self.dropout(attention_probs)
+
+            # Compute context: (batch, heads, seq, dim)
+            context_layer = torch.matmul(
+                attention_probs.unsqueeze(-2),  # (batch, heads, seq, 1, k)
+                sparse_values  # (batch, heads, seq, k, dim)
+            ).squeeze(-2)
+
+        else:
+            # FULL ATTENTION (original)
+            attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
+
+            if self.has_relative_attention_bias and self.has_spatial_attention_bias:
+                attention_scores += (rel_pos + rel_2d_pos) / math.sqrt(self.attention_head_size)
+            elif self.has_relative_attention_bias:
+                attention_scores += rel_pos / math.sqrt(self.attention_head_size)
+
+            if attention_mask is not None:
+                attention_scores = attention_scores + attention_mask
+
+            attention_probs = self.cogview_attention(attention_scores)
+            attention_probs = self.dropout(attention_probs)
+            context_layer = torch.matmul(attention_probs, value_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -315,6 +390,7 @@ class SuperDocAttention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
+        sparse_indices=None,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -322,6 +398,7 @@ class SuperDocAttention(nn.Module):
             output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
+            sparse_indices=sparse_indices,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -345,6 +422,7 @@ class SuperDocLayer(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
+        sparse_indices=None,
     ):
         self_attention_outputs = self.attention(
             hidden_states,
@@ -352,6 +430,7 @@ class SuperDocLayer(nn.Module):
             output_attentions=output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
+            sparse_indices=sparse_indices,
         )
         attention_output = self_attention_outputs[0]
 
@@ -395,72 +474,35 @@ class SuperDocEncoder(nn.Module):
             self.rel_pos_x_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
             self.rel_pos_y_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
 
-    def _compute_sparse_attention_mask(self, bbox, attention_mask, dtype, position_ids=None, text_seq_len=None):
+    def _compute_sparse_attention_indices(self, bbox, text_seq_len=None):
+        """
+        Compute k-nearest neighbor indices for TRUE sparse attention.
+        Returns: (batch, seq, k) tensor of indices for each token's neighbors.
+        """
         batch_size, seq_len = bbox.shape[:2]
         device = bbox.device
 
-        # Compute bbox centers
-        center_x = (bbox[:, :, 0] + bbox[:, :, 2]) / 2.0
-        center_y = (bbox[:, :, 1] + bbox[:, :, 3]) / 2.0
-        centers = torch.stack([center_x, center_y], dim=-1)  # (batch, seq, 2)
+        with torch.no_grad():
+            # Compute bbox centers
+            center_x = (bbox[:, :, 0] + bbox[:, :, 2]) / 2.0
+            center_y = (bbox[:, :, 1] + bbox[:, :, 3]) / 2.0
+            centers = torch.stack([center_x, center_y], dim=-1)  # (batch, seq, 2)
 
-        # Identify padding tokens (bbox=[0,0,0,0])
-        is_pad = (bbox == 0).all(dim=-1)
+            # Identify padding tokens (bbox=[0,0,0,0])
+            is_pad = (bbox == 0).all(dim=-1)
 
-        # Compute pairwise distances between all token centers
-        # centers: (batch, seq, 2) -> (batch, seq, 1, 2) and (batch, 1, seq, 2)
-        diff = centers.unsqueeze(2) - centers.unsqueeze(1)  # (batch, seq, seq, 2)
-        distances = (diff ** 2).sum(dim=-1)  # (batch, seq, seq) - squared Euclidean distance
+            # Compute pairwise squared Euclidean distances
+            distances = torch.cdist(centers, centers, p=2).pow_(2)  # (batch, seq, seq)
 
-        # Set distance to and from padding tokens as infinity
-        distances = distances.masked_fill(is_pad.unsqueeze(1), float('inf'))  # TO padding (columns)
-        distances = distances.masked_fill(is_pad.unsqueeze(2), float('inf'))  # FROM padding (rows)
+            # Set distance to and from padding tokens as infinity
+            distances.masked_fill_(is_pad.unsqueeze(1), float('inf'))
+            distances.masked_fill_(is_pad.unsqueeze(2), float('inf'))
 
-        # For each token, find the N nearest neighbors (clamp k to seq_len)
-        n_neighbors = min(self.sparse_n_neighbors, seq_len)
-        # topk returns (values, indices), we only need indices
-        _, nearest_indices = torch.topk(distances, k=n_neighbors, dim=-1, largest=False)
+            # For each token, find the N nearest neighbors
+            n_neighbors = min(self.sparse_n_neighbors, seq_len)
+            _, nearest_indices = torch.topk(distances, k=n_neighbors, dim=-1, largest=False)
 
-        # Create attention mask: token i attends to its N nearest neighbors
-        sparse_mask = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
-
-        # Scatter True values at positions of nearest neighbors
-        batch_idx = torch.arange(batch_size, device=device).view(-1, 1, 1).expand(-1, seq_len, n_neighbors)
-        token_idx = torch.arange(seq_len, device=device).view(1, -1, 1).expand(batch_size, -1, n_neighbors)
-        sparse_mask[batch_idx, token_idx, nearest_indices] = True
-
-        # Determine text and visual boundaries
-        if text_seq_len is not None and text_seq_len < seq_len:
-            # We have both text and visual tokens
-            text_cls_pos = 0
-            visual_cls_pos = text_seq_len
-
-            # All text tokens (including text CLS) attend to text CLS and vice versa
-            sparse_mask[:, :text_seq_len, text_cls_pos] = True
-            sparse_mask[:, text_cls_pos, :text_seq_len] = True
-
-            # All visual tokens (including visual CLS) attend to visual CLS and vice versa
-            sparse_mask[:, text_seq_len:, visual_cls_pos] = True
-            sparse_mask[:, visual_cls_pos, text_seq_len:] = True
-
-            # The two CLS tokens attend to each other
-            sparse_mask[:, text_cls_pos, visual_cls_pos] = True
-            sparse_mask[:, visual_cls_pos, text_cls_pos] = True
-        else:
-            # Only text tokens or only visual tokens - use global attention for position 0
-            sparse_mask[:, :, 0] = True
-            sparse_mask[:, 0, :] = True
-
-        # Convert to attention mask format (0 = attend, -inf = mask)
-        sparse_attn_mask = torch.zeros(batch_size, 1, seq_len, seq_len, device=device, dtype=dtype)
-        sparse_attn_mask.masked_fill_(~sparse_mask.unsqueeze(1), torch.finfo(dtype).min)
-
-        # Combine with original mask (respects padding)
-        if attention_mask is not None:
-            if attention_mask.shape[2] == 1:
-                attention_mask = attention_mask.expand(-1, -1, seq_len, -1)
-            return torch.minimum(sparse_attn_mask, attention_mask)
-        return sparse_attn_mask
+        return nearest_indices.detach()  # (batch, seq, k)
 
     def relative_position_bucket(self, relative_position, bidirectional=True, num_buckets=32, max_distance=128):
         ret = 0
@@ -548,17 +590,12 @@ class SuperDocEncoder(nn.Module):
         rel_pos = self._cal_1d_pos_emb(position_ids) if self.has_relative_attention_bias else None
         rel_2d_pos = self._cal_2d_pos_emb(bbox) if self.has_spatial_attention_bias else None
 
-        # Compute sparse attention mask once if actually needed
-        # Skip expensive O(n²) computation if:
-        # - global_attn_every_n_layers == 1 (all layers use full attention)
-        # - bbox is None (no spatial information available)
-        sparse_attention_mask = None
-        if self.global_attn_every_n_layers > 1 and bbox is not None:
-            sparse_attention_mask = self._compute_sparse_attention_mask(
+        # Compute sparse attention indices once if using sparse attention
+        use_sparse_attn = self.global_attn_every_n_layers > 1 and bbox is not None
+        sparse_indices = None
+        if use_sparse_attn:
+            sparse_indices = self._compute_sparse_attention_indices(
                 bbox=bbox,
-                attention_mask=attention_mask,
-                dtype=hidden_states.dtype,
-                position_ids=position_ids,
                 text_seq_len=text_seq_len,
             )
 
@@ -566,21 +603,22 @@ class SuperDocEncoder(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # Determine which attention mask to use for this layer
-            # Use global attention if global_attn_every_n_layers == 1 (all global)
-            # or if this is a global attention layer (every N-th layer)
+            # Determine whether to use sparse attention for this layer
             use_global_attn = (
                 self.global_attn_every_n_layers == 1 or
                 (i + 1) % self.global_attn_every_n_layers == 0
             )
-            layer_attention_mask = attention_mask if use_global_attn else sparse_attention_mask
+
+            # Pass sparse_indices for sparse layers, None for full attention layers
+            layer_sparse_indices = None if use_global_attn else sparse_indices
 
             layer_outputs = layer_module(
                 hidden_states,
-                layer_attention_mask,
+                attention_mask,
                 output_attentions,
                 rel_pos=rel_pos,
                 rel_2d_pos=rel_2d_pos,
+                sparse_indices=layer_sparse_indices,
             )
 
             hidden_states = layer_outputs[0]
