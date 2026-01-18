@@ -283,13 +283,30 @@ class SuperDocSelfAttention(nn.Module):
         )
 
         if use_flex_attention:
-            # Create score_mod function to add relative position biases
-            if attention_bias is not None:
-                # Capture the bias tensor in a closure for score_mod
+            # Create score_mod function to add relative position biases AND padding mask
+            # Both need to be handled in score_mod since block_mask is static (B=None for torch.compile)
+            has_bias = attention_bias is not None
+            has_mask = attention_mask is not None
+
+            if has_bias or has_mask:
+                # Capture tensors in closure for score_mod
                 bias_tensor = attention_bias
+                mask_tensor = attention_mask
 
                 def score_mod(score, b, h, q_idx, kv_idx):
-                    return score + bias_tensor[b, h, q_idx, kv_idx]
+                    result = score
+                    if has_bias:
+                        result = result + bias_tensor[b, h, q_idx, kv_idx]
+                    if has_mask:
+                        # attention_mask shape is [B, 1, 1, seq_len] or [B, 1, seq_len, seq_len]
+                        # We need to index based on kv_idx (the key position being masked)
+                        if mask_tensor.dim() == 4 and mask_tensor.shape[2] == 1:
+                            # Shape [B, 1, 1, seq_len] - broadcast over q_idx
+                            result = result + mask_tensor[b, 0, 0, kv_idx]
+                        else:
+                            # Shape [B, 1, seq_len, seq_len] or similar
+                            result = result + mask_tensor[b, 0, q_idx, kv_idx]
+                    return result
             else:
                 score_mod = None
 
@@ -589,20 +606,22 @@ class SuperDocEncoder(nn.Module):
 
         return mask
 
-    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, batch_size, device, padding_mask=None):
+    def _create_flex_block_mask(self, seq_len, window_size, text_seq_len, device):
         """
-        Create a BlockMask for flex_attention with sliding window pattern and padding support.
+        Create a BlockMask for flex_attention with sliding window pattern.
 
         This enables TRUE sparse attention computation (O(N*W) instead of O(N²))
         when running on CUDA with flex_attention.
+
+        Note: Padding is handled via score_mod in the attention layer, not here.
+        This allows the block_mask to be static (B=None) which is more compatible
+        with torch.compile.
 
         Args:
             seq_len: total sequence length
             window_size: number of tokens to attend to on each side
             text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
-            batch_size: batch size (needed for per-batch padding masks)
             device: torch device (must be CUDA for flex_attention)
-            padding_mask: (batch, seq_len) tensor where True = padding token
 
         Returns:
             BlockMask for flex_attention, or None if flex_attention unavailable
@@ -610,18 +629,16 @@ class SuperDocEncoder(nn.Module):
         if not _FLEX_ATTENTION_AVAILABLE or device.type != 'cuda':
             return None
 
-        # Capture padding_mask for use in mask_mod
-        _padding_mask = padding_mask
-
-        # Define the mask_mod function for sliding window + CLS global attention + padding
-        def sliding_window_with_cls_and_padding(b, h, q_idx, kv_idx):
+        # Define the mask_mod function for sliding window + CLS global attention
+        # Padding is handled separately via score_mod for torch.compile compatibility
+        def sliding_window_with_cls(b, h, q_idx, kv_idx):
             # Sliding window: attend if within window_size
             in_window = torch.abs(q_idx - kv_idx) <= window_size
 
             if text_seq_len is None or text_seq_len == 0:
                 # Visual-only mode: CLS at position 0 has global attention
                 is_cls = (q_idx == 0) | (kv_idx == 0)
-                attend = in_window | is_cls
+                return in_window | is_cls
             else:
                 # Text CLS (pos 0): global attention to text only
                 text_cls_query = (q_idx == 0) & (kv_idx < text_seq_len)
@@ -631,21 +648,15 @@ class SuperDocEncoder(nn.Module):
                 visual_cls_query = (q_idx == text_seq_len) & (kv_idx >= text_seq_len)
                 visual_cls_key = (kv_idx == text_seq_len) & (q_idx >= text_seq_len)
 
-                attend = in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
-
-            # Mask out padding tokens (don't attend to padding)
-            if _padding_mask is not None:
-                is_kv_padding = _padding_mask[b, kv_idx]
-                attend = attend & ~is_kv_padding
-
-            return attend
+                return in_window | text_cls_query | text_cls_key | visual_cls_query | visual_cls_key
 
         try:
-            # Create block mask with batch dimension for per-batch padding support
+            # Create block mask with B=None for static pattern (broadcasts across batch)
+            # This is more compatible with torch.compile
             block_mask = create_block_mask(
-                sliding_window_with_cls_and_padding,
-                B=batch_size,
-                H=None,  # Broadcast across heads
+                sliding_window_with_cls,
+                B=None,
+                H=None,
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
                 device=device,
@@ -786,13 +797,12 @@ class SuperDocEncoder(nn.Module):
             padding_mask = (bbox == 0).all(dim=-1)  # (batch, seq)
 
             # Try to create flex_attention BlockMask for TRUE sparse attention (CUDA only)
+            # Padding is handled via score_mod in attention, not in block_mask
             flex_block_mask = self._create_flex_block_mask(
                 seq_len=seq_len,
                 window_size=self.sliding_window_size,
                 text_seq_len=text_seq_len,
-                batch_size=batch_size,
                 device=hidden_states.device,
-                padding_mask=padding_mask,
             )
 
             # Create dense fallback mask (used on CPU or when flex_attention fails)
