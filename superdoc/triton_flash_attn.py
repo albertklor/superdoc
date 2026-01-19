@@ -1,7 +1,5 @@
 """
-Triton Flash Attention with Bias support.
-
-Based on Flash Attention algorithm with proper logsumexp saving for correct backward pass.
+Adapted from https://github.com/Dao-AILab/flash-attention
 """
 
 import torch
