@@ -221,6 +221,14 @@ def _bwd_kernel(
 
         # Compute dS = P * (dP - Delta)
         ds = p * (dp - delta[:, None])
+
+        # Compute dBias BEFORE scaling ds (dBias = dS, not dS * scale)
+        if HAVE_BIAS:
+            dbias_ptrs = DBias + off_hb * stride_dbh + offs_m_curr[:, None] * stride_dbm + offs_n[None, :] * stride_dbn
+            tl.atomic_add(dbias_ptrs, ds,
+                         mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k))
+
+        # Scale for dQ and dK computation
         ds = ds * softmax_scale
 
         # Compute dK
@@ -231,12 +239,6 @@ def _bwd_kernel(
         dq = tl.dot(ds_f16, k)
         dq_ptrs = DQ + off_hb * stride_dqh + offs_m_curr[:, None] * stride_dqm + offs_d[None, :] * stride_dqk
         tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
-
-        # Compute dBias if needed
-        if HAVE_BIAS:
-            dbias_ptrs = DBias + off_hb * stride_dbh + offs_m_curr[:, None] * stride_dbm + offs_n[None, :] * stride_dbn
-            tl.atomic_add(dbias_ptrs, ds,
-                         mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k))
 
     # Store dK, dV
     dk_ptrs = DK + off_hb * stride_dkh + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkk

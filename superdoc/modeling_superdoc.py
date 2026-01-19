@@ -246,14 +246,16 @@ class SuperDocSelfAttention(nn.Module):
 
         # Combine all biases into a single tensor for the triton kernel
         # Shape: (batch, heads, seq_len, seq_len)
+        # Note: biases are added to scores AFTER QK^T is scaled by 1/sqrt(d),
+        # so biases should NOT be pre-scaled
         bias = None
         if self.has_relative_attention_bias and rel_pos is not None:
-            bias = rel_pos / math.sqrt(self.attention_head_size)
+            bias = rel_pos
         if self.has_spatial_attention_bias and rel_2d_pos is not None:
             if bias is not None:
-                bias = bias + rel_2d_pos / math.sqrt(self.attention_head_size)
+                bias = bias + rel_2d_pos
             else:
-                bias = rel_2d_pos / math.sqrt(self.attention_head_size)
+                bias = rel_2d_pos
         if attention_mask is not None:
             if bias is not None:
                 bias = bias + attention_mask
