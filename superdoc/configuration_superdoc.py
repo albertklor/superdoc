@@ -71,13 +71,6 @@ class SuperDocConfig(PretrainedConfig):
             The size (resolution) of the patches.
         classifier_dropout (`float`, *optional*):
             The dropout ratio for the classification head.
-        global_attn_every_n_layers (`int`, *optional*, defaults to 1):
-            Use global (full) attention every N layers. Set to 1 for all global attention (default, backwards
-            compatible). Set to higher values to use sliding window attention on other layers.
-        sliding_window_size (`int`, *optional*, defaults to 64):
-            Window size for sliding window attention. Each token attends to `window_size` tokens on each side
-            after spatial reordering based on bbox centers. CLS tokens use global attention within their modality.
-            Recommended values: 64 (balanced), 128 (more context), 32 (minimal).
 
     Example:
 
@@ -128,8 +121,6 @@ class SuperDocConfig(PretrainedConfig):
         num_channels=3,
         patch_size=16,
         classifier_dropout=0.0,
-        global_attn_every_n_layers=1,
-        sliding_window_size=64,
         **kwargs,
     ):
         super().__init__(
@@ -165,8 +156,6 @@ class SuperDocConfig(PretrainedConfig):
         self.num_channels = num_channels
         self.patch_size = patch_size
         self.classifier_dropout = classifier_dropout
-        self.global_attn_every_n_layers = global_attn_every_n_layers
-        self.sliding_window_size = sliding_window_size
 
 
 __all__ = ["SuperDocConfig"]

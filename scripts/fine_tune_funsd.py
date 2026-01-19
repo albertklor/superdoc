@@ -69,7 +69,6 @@ def main():
     train_dataset.set_format("torch")
     eval_dataset.set_format("torch")
 
-    config.global_attn_every_n_layers = 4
     model = SuperDocForTokenClassification.from_pretrained(args.hf_path, config=config)
 
     metric = load_metric("seqeval")

@@ -1,6 +1,5 @@
 import collections
 import math
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -17,7 +16,9 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import apply_chunking_to_forward
 from transformers.utils import logging
+
 from .configuration_superdoc import SuperDocConfig
+from .triton_flash_attn import flash_attention_with_bias
 
 
 logger = logging.get_logger(__name__)
@@ -98,7 +99,6 @@ class SuperDocTextEmbeddings(nn.Module):
         h_position_embeddings = self.h_position_embeddings(torch.clip(bbox[:, :, 3] - bbox[:, :, 1], 0, 1023))
         w_position_embeddings = self.w_position_embeddings(torch.clip(bbox[:, :, 2] - bbox[:, :, 0], 0, 1023))
 
-        # below is the difference between LayoutLMEmbeddingsV2 (torch.cat) and LayoutLMEmbeddingsV1 (add)
         spatial_position_embeddings = torch.cat(
             [
                 left_position_embeddings,
@@ -177,22 +177,22 @@ class SuperDocTextEmbeddings(nn.Module):
 
 
 class SuperDocPreTrainedModel(PreTrainedModel):
-    config: SuperDocConfig
-    base_model_prefix = "layoutlmv3"
-    input_modalities = ("image", "text")
+    config_class = SuperDocConfig
+    base_model_prefix = "superdoc"
 
-    @torch.no_grad()
     def _init_weights(self, module):
         """Initialize the weights"""
-        super()._init_weights(module)
-        if isinstance(module, SuperDocModel):
-            if self.config.visual_embed:
-                nn.init.zeros_(module.cls_token)
-                nn.init.zeros_(module.pos_embed)
-            if hasattr(module, "visual_bbox"):
-                module.visual_bbox.copy_(module.create_visual_bbox(image_size=(module.size, module.size)))
-        elif isinstance(module, SuperDocTextEmbeddings):
-            module.position_ids.copy_(torch.arange(module.position_ids.shape[-1]).expand((1, -1)))
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
 
 class SuperDocSelfAttention(nn.Module):
@@ -216,18 +216,6 @@ class SuperDocSelfAttention(nn.Module):
         self.has_relative_attention_bias = config.has_relative_attention_bias
         self.has_spatial_attention_bias = config.has_spatial_attention_bias
 
-    def cogview_attention(self, attention_scores, alpha=32):
-        """
-        https://huggingface.co/papers/2105.13290 Section 2.4 Stabilization of training: Precision Bottleneck Relaxation
-        (PB-Relax). A replacement of the original nn.Softmax(dim=-1)(attention_scores). Seems the new attention_probs
-        will result in a slower speed and a little bias. Can use torch.allclose(standard_attention_probs,
-        cogview_attention_probs, atol=1e-08) for comparison. The smaller atol (e.g., 1e-08), the better.
-        """
-        scaled_attention_scores = attention_scores / alpha
-        max_value = scaled_attention_scores.amax(dim=(-1)).unsqueeze(-1)
-        new_attention_scores = (scaled_attention_scores - max_value) * alpha
-        return nn.Softmax(dim=-1)(new_attention_scores)
-
     def forward(
         self,
         hidden_states,
@@ -236,6 +224,9 @@ class SuperDocSelfAttention(nn.Module):
         rel_pos=None,
         rel_2d_pos=None,
     ):
+        if output_attentions:
+            raise ValueError("output_attentions=True is not supported with triton flash attention")
+
         batch_size, seq_length, _ = hidden_states.shape
         query_layer = (
             self.query(hidden_states)
@@ -253,71 +244,42 @@ class SuperDocSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # Add relative position biases to create combined attention bias
-        attention_bias = None
-        if self.has_relative_attention_bias or self.has_spatial_attention_bias:
-            attention_bias = torch.zeros(batch_size, self.num_attention_heads, seq_length, seq_length,
-                                         device=hidden_states.device, dtype=hidden_states.dtype)
-            if self.has_relative_attention_bias and rel_pos is not None:
-                attention_bias = attention_bias + rel_pos
-            if self.has_spatial_attention_bias and rel_2d_pos is not None:
-                attention_bias = attention_bias + rel_2d_pos
-
-        # NOTE: flex_attention with score_mod is incompatible with torch.compile
-        # because captured tensors in score_mod closures can't be traced properly.
-        # We use scaled_dot_product_attention instead, which still benefits from
-        # Flash Attention kernels while supporting relative position biases and padding.
-        # The sliding window pattern is applied via the dense attention mask.
-        if True:  # Dense attention path
-            # Combine attention mask with bias for dense attention
-            if attention_mask is not None:
-                if attention_bias is not None:
-                    attention_bias = attention_bias + attention_mask
-                else:
-                    attention_bias = attention_mask
-
-            # Use scaled_dot_product_attention for memory efficiency when not outputting attentions
-            # This uses Flash Attention or Memory-Efficient Attention when available
-            if not output_attentions and attention_bias is not None:
-                context_layer = F.scaled_dot_product_attention(
-                    query_layer,
-                    key_layer,
-                    value_layer,
-                    attn_mask=attention_bias,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    scale=1.0 / math.sqrt(self.attention_head_size),
-                )
-                attention_probs = None
-            elif not output_attentions and attention_bias is None:
-                context_layer = F.scaled_dot_product_attention(
-                    query_layer,
-                    key_layer,
-                    value_layer,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    scale=1.0 / math.sqrt(self.attention_head_size),
-                )
-                attention_probs = None
+        # Combine all biases into a single tensor for the triton kernel
+        # Shape: (batch, heads, seq_len, seq_len)
+        bias = None
+        if self.has_relative_attention_bias and rel_pos is not None:
+            bias = rel_pos / math.sqrt(self.attention_head_size)
+        if self.has_spatial_attention_bias and rel_2d_pos is not None:
+            if bias is not None:
+                bias = bias + rel_2d_pos / math.sqrt(self.attention_head_size)
             else:
-                # Fallback to manual computation when we need attention weights
-                attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
+                bias = rel_2d_pos / math.sqrt(self.attention_head_size)
+        if attention_mask is not None:
+            if bias is not None:
+                bias = bias + attention_mask
+            else:
+                bias = attention_mask.expand(batch_size, self.num_attention_heads, seq_length, seq_length)
 
-                if attention_bias is not None:
-                    attention_scores = attention_scores + attention_bias
+        # Call triton kernel
+        context_layer = flash_attention_with_bias(
+            query_layer,
+            key_layer,
+            value_layer,
+            bias=bias,
+            softmax_scale=1.0 / math.sqrt(self.attention_head_size),
+        )
 
-                attention_probs = self.cogview_attention(attention_scores)
-                attention_probs = self.dropout(attention_probs)
-                context_layer = torch.matmul(attention_probs, value_layer)
+        # Apply dropout
+        if self.training and self.dropout.p > 0:
+            context_layer = self.dropout(context_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
-
-        return outputs
+        return (context_layer,)
 
 
-# Copied from transformers.models.roberta.modeling_roberta.RobertaSelfOutput
 class SuperDocSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -332,7 +294,6 @@ class SuperDocSelfOutput(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.layoutlmv2.modeling_layoutlmv2.LayoutLMv2Attention with LayoutLMv2->SuperDoc
 class SuperDocAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -359,11 +320,39 @@ class SuperDocAttention(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.layoutlmv2.modeling_layoutlmv2.LayoutLMv2Layer with LayoutLMv2->SuperDoc
+class SuperDocIntermediate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.intermediate_act_fn = config.hidden_act
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        return hidden_states
+
+
+class SuperDocOutput(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        return hidden_states
+
+
 class SuperDocLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward if hasattr(config, 'chunk_size_feed_forward') else 0
         self.seq_len_dim = 1
         self.attention = SuperDocAttention(config)
         self.intermediate = SuperDocIntermediate(config)
@@ -411,10 +400,6 @@ class SuperDocEncoder(nn.Module):
         self.has_relative_attention_bias = config.has_relative_attention_bias
         self.has_spatial_attention_bias = config.has_spatial_attention_bias
 
-        # Sliding window attention parameters
-        self.global_attn_every_n_layers = config.global_attn_every_n_layers
-        self.sliding_window_size = config.sliding_window_size
-
         if self.has_relative_attention_bias:
             self.rel_pos_bins = config.rel_pos_bins
             self.max_rel_pos = config.max_rel_pos
@@ -425,124 +410,6 @@ class SuperDocEncoder(nn.Module):
             self.rel_2d_pos_bins = config.rel_2d_pos_bins
             self.rel_pos_x_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
             self.rel_pos_y_bias = nn.Linear(self.rel_2d_pos_bins, config.num_attention_heads, bias=False)
-
-    def _compute_spatial_sort_order(self, bbox, text_seq_len=None):
-        """
-        Compute sort order based on bbox centers for sliding window attention.
-        Sorts tokens in reading order (top-to-bottom, left-to-right).
-
-        IMPORTANT: CLS tokens are kept at fixed positions:
-        - Text CLS stays at position 0
-        - Visual CLS stays at position text_seq_len
-        Only content tokens within each modality are sorted.
-
-        Returns:
-            sort_indices: (batch, seq) indices to sort tokens by spatial position
-            unsort_indices: (batch, seq) indices to restore original order
-        """
-        batch_size, seq_len = bbox.shape[:2]
-        device = bbox.device
-
-        with torch.no_grad():
-            # Start with identity mapping
-            sort_indices = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1).clone()
-
-            # Compute bbox centers
-            center_x = (bbox[:, :, 0] + bbox[:, :, 2]) / 2.0  # (batch, seq)
-            center_y = (bbox[:, :, 1] + bbox[:, :, 3]) / 2.0  # (batch, seq)
-
-            # Identify padding tokens (bbox=[0,0,0,0])
-            is_pad = (bbox == 0).all(dim=-1)  # (batch, seq)
-
-            # Create sort key: (y_center * 10000 + x_center) for reading order
-            sort_key = center_y * 10000 + center_x  # (batch, seq)
-            # Padding tokens get max value to stay at the end of their section
-            sort_key = sort_key.masked_fill(is_pad, float('inf'))
-
-            if text_seq_len is None or text_seq_len == 0:
-                # Visual-only mode: CLS at position 0, sort content tokens (positions 1+)
-                if seq_len > 1:
-                    visual_content_keys = sort_key[:, 1:]  # (batch, seq_len-1)
-                    visual_content_order = torch.argsort(visual_content_keys, dim=-1)
-                    sort_indices[:, 1:] = visual_content_order + 1
-            else:
-                if text_seq_len > 1:
-                    # Sort text content tokens (positions 1 to text_seq_len-1), keep CLS at 0
-                    text_content_keys = sort_key[:, 1:text_seq_len]  # (batch, text_seq_len-1)
-                    text_content_order = torch.argsort(text_content_keys, dim=-1)  # relative indices
-                    # Convert to absolute indices (add 1 since we skipped position 0)
-                    sort_indices[:, 1:text_seq_len] = text_content_order + 1
-
-                if text_seq_len < seq_len - 1:
-                    # Sort visual content tokens (positions text_seq_len+1 to end), keep visual CLS at text_seq_len
-                    visual_content_keys = sort_key[:, text_seq_len + 1:]  # (batch, num_visual_content)
-                    visual_content_order = torch.argsort(visual_content_keys, dim=-1)  # relative indices
-                    # Convert to absolute indices
-                    sort_indices[:, text_seq_len + 1:] = visual_content_order + text_seq_len + 1
-
-            # Compute inverse permutation (unsort indices)
-            unsort_indices = torch.argsort(sort_indices, dim=-1)  # (batch, seq)
-
-        return sort_indices.detach(), unsort_indices.detach()
-
-    def _create_sliding_window_mask(self, seq_len, window_size, text_seq_len, device, dtype, padding_mask=None):
-        """
-        Create sliding window attention mask with global attention for CLS tokens.
-
-        Args:
-            seq_len: total sequence length
-            window_size: number of tokens to attend to on each side
-            text_seq_len: length of text sequence (visual starts at text_seq_len), None for visual-only
-            device: torch device
-            dtype: torch dtype for mask values
-            padding_mask: (batch, seq_len) tensor where True = padding token
-
-        Returns:
-            attention_mask: (batch, 1, seq_len, seq_len) mask with 0 for attend, -inf for masked
-        """
-        # Start with all masked
-        mask = torch.full((seq_len, seq_len), float('-inf'), device=device, dtype=dtype)
-
-        # Create sliding window for all content tokens (allows cross-modality at boundary)
-        for i in range(seq_len):
-            start = max(0, i - window_size)
-            end = min(seq_len, i + window_size + 1)
-            mask[i, start:end] = 0.0
-
-        if text_seq_len is None or text_seq_len == 0:
-            # Visual-only mode: CLS is at position 0, all tokens are visual
-            mask[0, :] = 0.0  # Visual CLS attends to all tokens
-            mask[:, 0] = 0.0  # All tokens attend to visual CLS
-        elif text_seq_len > 0:
-            # Text CLS token (position 0): global attention to ALL text, NOT visual
-            # First, ensure CLS row only attends to text (override sliding window)
-            mask[0, :] = float('-inf')  # Reset row
-            mask[0, :text_seq_len] = 0.0  # Text CLS attends to all text only
-            # All text tokens attend to text CLS (column 0 for text rows)
-            mask[:text_seq_len, 0] = 0.0
-
-            # Visual CLS token (position text_seq_len): global attention to ALL visual, NOT text
-            if text_seq_len < seq_len:
-                visual_start = text_seq_len
-                # Reset visual CLS row and set only visual attention
-                mask[visual_start, :] = float('-inf')
-                mask[visual_start, visual_start:] = 0.0  # Visual CLS attends to all visual only
-                # All visual tokens attend to visual CLS
-                mask[visual_start:, visual_start] = 0.0
-
-        # Expand for batch and head dimensions: (1, 1, seq_len, seq_len)
-        mask = mask.unsqueeze(0).unsqueeze(0)
-
-        # Incorporate padding mask if provided
-        if padding_mask is not None:
-            # padding_mask: (batch, seq_len) where True = padding
-            # Expand to (batch, 1, 1, seq_len) for broadcasting
-            padding_mask_expanded = padding_mask.unsqueeze(1).unsqueeze(2)
-            # Set attention to padding tokens to -inf
-            mask = mask.expand(padding_mask.shape[0], -1, -1, -1).clone()
-            mask.masked_fill_(padding_mask_expanded, float('-inf'))
-
-        return mask
 
     def relative_position_bucket(self, relative_position, bidirectional=True, num_buckets=32, max_distance=128):
         ret = 0
@@ -622,113 +489,38 @@ class SuperDocEncoder(nn.Module):
         position_ids=None,
         patch_height=None,
         patch_width=None,
-        text_seq_len=None,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        # Determine if we should use sliding window attention
-        use_sliding_window = self.global_attn_every_n_layers > 1 and bbox is not None
-
-        # Reorder tokens ONCE at the beginning if using sliding window
-        unsort_indices = None
-        if use_sliding_window:
-            batch_size = hidden_states.shape[0]
-            batch_idx = torch.arange(batch_size, device=hidden_states.device).unsqueeze(1)
-
-            # Compute spatial sort order based on bbox centers
-            sort_indices, unsort_indices = self._compute_spatial_sort_order(
-                bbox=bbox,
-                text_seq_len=text_seq_len,
-            )
-
-            # Reorder hidden states
-            hidden_states = hidden_states[batch_idx, sort_indices]
-
-            # Reorder bbox for relative position computation
-            bbox = bbox[batch_idx, sort_indices]
-
-            # Reorder position_ids
-            position_ids = position_ids[batch_idx, sort_indices]
-
-            # Reorder attention mask if present
-            if attention_mask is not None:
-                # attention_mask is extended: (batch, 1, 1, seq) or (batch, 1, seq, seq)
-                if attention_mask.dim() == 4 and attention_mask.shape[2] == 1:
-                    # (batch, 1, 1, seq) - reorder last dim using gather
-                    # sort_indices: (batch, seq)
-                    # We need to gather along the last dimension
-                    attention_mask = torch.gather(
-                        attention_mask,
-                        dim=3,
-                        index=sort_indices.unsqueeze(1).unsqueeze(1)  # (batch, 1, 1, seq)
-                    )
-                elif attention_mask.dim() == 4:
-                    # (batch, 1, seq, seq) - this is rare, but handle it
-                    # For now, we'll skip reordering this complex case and just
-                    # rely on the sliding_mask for attention pattern
-                    pass
-
-            # Create sliding window mask (with CLS global attention and padding)
-            seq_len = hidden_states.shape[1]
-            # Identify padding tokens from reordered bbox
-            padding_mask = (bbox == 0).all(dim=-1)  # (batch, seq)
-
-            # NOTE: flex_attention is disabled because score_mod with captured tensors
-            # is incompatible with torch.compile. We use scaled_dot_product_attention
-            # with a dense sliding window mask instead.
-
-            # Create sliding window mask (with padding)
-            sliding_mask = self._create_sliding_window_mask(
-                seq_len=seq_len,
-                window_size=self.sliding_window_size,
-                text_seq_len=text_seq_len,
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-                padding_mask=padding_mask,
-            )
-
-        # Compute relative position embeddings on the (possibly reordered) sequence
         rel_pos = self._cal_1d_pos_emb(position_ids) if self.has_relative_attention_bias else None
         rel_2d_pos = self._cal_2d_pos_emb(bbox) if self.has_spatial_attention_bias else None
 
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
-                # Store hidden states in original (unsorted) order for consistency
-                if unsort_indices is not None:
-                    batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device).unsqueeze(1)
-                    all_hidden_states = all_hidden_states + (hidden_states[batch_idx, unsort_indices],)
-                else:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # Determine whether to use sliding window attention for this layer
-            # Use global attention if: (1) config says all layers are global, (2) this is a global layer,
-            # or (3) sliding window wasn't set up (e.g., bbox is None)
-            use_global_attn = (
-                not use_sliding_window or
-                self.global_attn_every_n_layers == 1 or
-                (i + 1) % self.global_attn_every_n_layers == 0
-            )
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    attention_mask,
+                    output_attentions,
+                    rel_pos,
+                    rel_2d_pos,
+                )
+            else:
+                layer_outputs = layer_module(
+                    hidden_states,
+                    attention_mask,
+                    output_attentions,
+                    rel_pos=rel_pos,
+                    rel_2d_pos=rel_2d_pos,
+                )
 
-            # Choose mask: sliding window or full attention
-            layer_mask = attention_mask if use_global_attn else sliding_mask
-
-            layer_outputs = layer_module(
-                hidden_states,
-                layer_mask,
-                output_attentions,
-                rel_pos=rel_pos,
-                rel_2d_pos=rel_2d_pos,
-            )
             hidden_states = layer_outputs[0]
-
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
-        # Reorder back to original positions at the end
-        if unsort_indices is not None:
-            batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device).unsqueeze(1)
-            hidden_states = hidden_states[batch_idx, unsort_indices]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -748,37 +540,6 @@ class SuperDocEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
-
-
-# Copied from transformers.models.roberta.modeling_roberta.RobertaIntermediate
-class SuperDocIntermediate(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        return hidden_states
-
-
-# Copied from transformers.models.roberta.modeling_roberta.RobertaOutput
-class SuperDocOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
 
 
 class SuperDocModel(SuperDocPreTrainedModel):
@@ -864,83 +625,37 @@ class SuperDocModel(SuperDocPreTrainedModel):
 
         return embeddings
 
+    def _get_extended_attention_mask(self, attention_mask, input_shape, device, dtype):
+        """
+        Creates extended attention mask for padding tokens.
+        """
+        if attention_mask is None:
+            return None
+
+        # attention_mask: [batch_size, seq_length]
+        # We need to create a mask of shape [batch_size, 1, 1, seq_length] for broadcasting
+        extended_attention_mask = attention_mask[:, None, None, :]
+
+        # Convert to float and apply large negative value for masked positions
+        extended_attention_mask = extended_attention_mask.to(dtype=dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(dtype).min
+
+        return extended_attention_mask
+
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        bbox: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         **kwargs,
-    ) -> Union[tuple, BaseModelOutput]:
-        r"""
-        input_ids (`torch.LongTensor` of shape `(batch_size, token_sequence_length)`):
-            Indices of input sequence tokens in the vocabulary.
-
-            Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
-            token. See `pixel_values` for `patch_sequence_length`.
-
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are input IDs?](../glossary#input-ids)
-        bbox (`torch.LongTensor` of shape `(batch_size, token_sequence_length, 4)`, *optional*):
-            Bounding boxes of each input sequence tokens. Selected in the range `[0,
-            config.max_2d_position_embeddings-1]`. Each bounding box should be a normalized version in (x0, y0, x1, y1)
-            format, where (x0, y0) corresponds to the position of the upper left corner in the bounding box, and (x1,
-            y1) represents the position of the lower right corner.
-
-            Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
-            token. See `pixel_values` for `patch_sequence_length`.
-        token_type_ids (`torch.LongTensor` of shape `(batch_size, token_sequence_length)`, *optional*):
-            Segment token indices to indicate first and second portions of the inputs. Indices are selected in `[0,
-            1]`:
-
-            - 0 corresponds to a *sentence A* token,
-            - 1 corresponds to a *sentence B* token.
-
-            Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
-            token. See `pixel_values` for `patch_sequence_length`.
-
-            [What are token type IDs?](../glossary#token-type-ids)
-        position_ids (`torch.LongTensor` of shape `(batch_size, token_sequence_length)`, *optional*):
-            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
-            config.max_position_embeddings - 1]`.
-
-            Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
-            token. See `pixel_values` for `patch_sequence_length`.
-
-            [What are position IDs?](../glossary#position-ids)
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, token_sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert *input_ids* indices into associated vectors than the
-            model's internal embedding lookup matrix.
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoProcessor, AutoModel
-        >>> from datasets import load_dataset
-
-        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
-        >>> model = AutoModel.from_pretrained("microsoft/layoutlmv3-base")
-
-        >>> dataset = load_dataset("nielsr/funsd-layoutlmv3", split="train")
-        >>> example = dataset[0]
-        >>> image = example["image"]
-        >>> words = example["tokens"]
-        >>> boxes = example["bboxes"]
-
-        >>> encoding = processor(image, words, boxes=boxes, return_tensors="pt")
-
-        >>> outputs = model(**encoding)
-        >>> last_hidden_states = outputs.last_hidden_state
-        ```"""
+    ) -> tuple | BaseModelOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -979,7 +694,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
 
         final_bbox = final_position_ids = None
         patch_height = patch_width = None
-        text_seq_len = None
         if pixel_values is not None:
             patch_height, patch_width = (
                 int(pixel_values.shape[2] / self.config.patch_size),
@@ -1013,7 +727,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
                     final_position_ids = visual_position_ids
 
             if input_ids is not None or inputs_embeds is not None:
-                text_seq_len = embedding_output.shape[1]
                 embedding_output = torch.cat([embedding_output, visual_embeddings], dim=1)
             else:
                 embedding_output = visual_embeddings
@@ -1028,8 +741,8 @@ class SuperDocModel(SuperDocPreTrainedModel):
                 position_ids = position_ids.expand_as(input_ids)
                 final_position_ids = position_ids
 
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, None, device, dtype=embedding_output.dtype
+        extended_attention_mask = self._get_extended_attention_mask(
+            attention_mask, None, device=embedding_output.device, dtype=embedding_output.dtype
         )
 
         encoder_outputs = self.encoder(
@@ -1042,7 +755,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
             return_dict=return_dict,
             patch_height=patch_height,
             patch_width=patch_width,
-            text_seq_len=text_seq_len,
         )
 
         sequence_output = encoder_outputs[0]
@@ -1085,15 +797,11 @@ class SuperDocClassificationHead(nn.Module):
 
 
 class SuperDocForTokenClassification(SuperDocPreTrainedModel):
-    """
-    SuperDoc Model with a token classification head on top (a linear layer on top of the final hidden states) e.g.
-    for sequence labeling (information extraction) tasks such as FUNSD, SROIE, CORD and Kleister-NDA.
-    """
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.layoutlmv3 = SuperDocModel(config)
+        self.superdoc = SuperDocModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         if config.num_labels < 10:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
@@ -1103,60 +811,29 @@ class SuperDocForTokenClassification(SuperDocPreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.layoutlmv3.get_input_embeddings()
+        return self.superdoc.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.layoutlmv3.set_input_embeddings(value)
+        self.superdoc.set_input_embeddings(value)
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        pixel_values: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        bbox: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        pixel_values: torch.LongTensor | None = None,
         **kwargs,
-    ) -> Union[tuple, TokenClassifierOutput]:
-        r"""
-        bbox (`torch.LongTensor` of shape `(batch_size, sequence_length, 4)`, *optional*):
-            Bounding boxes of each input sequence tokens. Selected in the range `[0,
-            config.max_2d_position_embeddings-1]`. Each bounding box should be a normalized version in (x0, y0, x1, y1)
-            format, where (x0, y0) corresponds to the position of the upper left corner in the bounding box, and (x1,
-            y1) represents the position of the lower right corner.
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoProcessor, AutoModelForTokenClassification
-        >>> from datasets import load_dataset
-
-        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
-        >>> model = AutoModelForTokenClassification.from_pretrained("microsoft/layoutlmv3-base", num_labels=7)
-
-        >>> dataset = load_dataset("nielsr/funsd-layoutlmv3", split="train")
-        >>> example = dataset[0]
-        >>> image = example["image"]
-        >>> words = example["tokens"]
-        >>> boxes = example["bboxes"]
-        >>> word_labels = example["ner_tags"]
-
-        >>> encoding = processor(image, words, boxes=boxes, word_labels=word_labels, return_tensors="pt")
-
-        >>> outputs = model(**encoding)
-        >>> loss = outputs.loss
-        >>> logits = outputs.logits
-        ```"""
+    ) -> tuple | TokenClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.layoutlmv3(
+        outputs = self.superdoc(
             input_ids,
             bbox=bbox,
             attention_mask=attention_mask,
@@ -1201,70 +878,36 @@ class SuperDocForQuestionAnswering(SuperDocPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.layoutlmv3 = SuperDocModel(config)
+        self.superdoc = SuperDocModel(config)
         self.qa_outputs = SuperDocClassificationHead(config, pool_feature=False)
 
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.layoutlmv3.get_input_embeddings()
+        return self.superdoc.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.layoutlmv3.set_input_embeddings(value)
+        self.superdoc.set_input_embeddings(value)
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        start_positions: torch.LongTensor | None = None,
+        end_positions: torch.LongTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        bbox: torch.LongTensor | None = None,
+        pixel_values: torch.LongTensor | None = None,
         **kwargs,
-    ) -> Union[tuple, QuestionAnsweringModelOutput]:
-        r"""
-        bbox (`torch.LongTensor` of shape `(batch_size, sequence_length, 4)`, *optional*):
-            Bounding boxes of each input sequence tokens. Selected in the range `[0,
-            config.max_2d_position_embeddings-1]`. Each bounding box should be a normalized version in (x0, y0, x1, y1)
-            format, where (x0, y0) corresponds to the position of the upper left corner in the bounding box, and (x1,
-            y1) represents the position of the lower right corner.
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoProcessor, AutoModelForQuestionAnswering
-        >>> from datasets import load_dataset
-        >>> import torch
-
-        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
-        >>> model = AutoModelForQuestionAnswering.from_pretrained("microsoft/layoutlmv3-base")
-
-        >>> dataset = load_dataset("nielsr/funsd-layoutlmv3", split="train")
-        >>> example = dataset[0]
-        >>> image = example["image"]
-        >>> question = "what's his name?"
-        >>> words = example["tokens"]
-        >>> boxes = example["bboxes"]
-
-        >>> encoding = processor(image, question, words, boxes=boxes, return_tensors="pt")
-        >>> start_positions = torch.tensor([1])
-        >>> end_positions = torch.tensor([3])
-
-        >>> outputs = model(**encoding, start_positions=start_positions, end_positions=end_positions)
-        >>> loss = outputs.loss
-        >>> start_scores = outputs.start_logits
-        >>> end_scores = outputs.end_logits
-        ```"""
-
+    ) -> tuple | QuestionAnsweringModelOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.layoutlmv3(
+        outputs = self.superdoc(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1315,73 +958,39 @@ class SuperDocForQuestionAnswering(SuperDocPreTrainedModel):
 
 
 class SuperDocForSequenceClassification(SuperDocPreTrainedModel):
-    """
-    SuperDoc Model with a sequence classification head on top (a linear layer on top of the final hidden state of the
-    [CLS] token) e.g. for document image classification tasks such as the RVL-CDIP dataset.
-    """
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.config = config
-        self.layoutlmv3 = SuperDocModel(config)
+        self.superdoc = SuperDocModel(config)
         self.classifier = SuperDocClassificationHead(config, pool_feature=False)
 
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.layoutlmv3.get_input_embeddings()
+        return self.superdoc.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.layoutlmv3.set_input_embeddings(value)
+        self.superdoc.set_input_embeddings(value)
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        bbox: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        bbox: torch.LongTensor | None = None,
+        pixel_values: torch.LongTensor | None = None,
         **kwargs,
-    ) -> Union[tuple, SequenceClassifierOutput]:
-        r"""
-        bbox (`torch.LongTensor` of shape `(batch_size, sequence_length, 4)`, *optional*):
-            Bounding boxes of each input sequence tokens. Selected in the range `[0,
-            config.max_2d_position_embeddings-1]`. Each bounding box should be a normalized version in (x0, y0, x1, y1)
-            format, where (x0, y0) corresponds to the position of the upper left corner in the bounding box, and (x1,
-            y1) represents the position of the lower right corner.
-
-        Examples:
-
-        ```python
-        >>> from transformers import AutoProcessor, AutoModelForSequenceClassification
-        >>> from datasets import load_dataset
-        >>> import torch
-
-        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
-        >>> model = AutoModelForSequenceClassification.from_pretrained("microsoft/layoutlmv3-base")
-
-        >>> dataset = load_dataset("nielsr/funsd-layoutlmv3", split="train")
-        >>> example = dataset[0]
-        >>> image = example["image"]
-        >>> words = example["tokens"]
-        >>> boxes = example["bboxes"]
-
-        >>> encoding = processor(image, words, boxes=boxes, return_tensors="pt")
-        >>> sequence_label = torch.tensor([1])
-
-        >>> outputs = model(**encoding, labels=sequence_label)
-        >>> loss = outputs.loss
-        >>> logits = outputs.logits
-        ```"""
+    ) -> tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.layoutlmv3(
+        outputs = self.superdoc(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1433,6 +1042,7 @@ class SuperDocForSequenceClassification(SuperDocPreTrainedModel):
 
 
 __all__ = [
+    "SuperDocConfig",
     "SuperDocForQuestionAnswering",
     "SuperDocForSequenceClassification",
     "SuperDocForTokenClassification",
