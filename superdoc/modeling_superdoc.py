@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .triton_flash_attn import flash_attention_with_bias
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
@@ -18,7 +20,6 @@ from transformers.pytorch_utils import apply_chunking_to_forward
 from transformers.utils import logging
 
 from .configuration_superdoc import SuperDocConfig
-from .triton_flash_attn import flash_attention_with_bias
 
 
 logger = logging.get_logger(__name__)
@@ -216,6 +217,18 @@ class SuperDocSelfAttention(nn.Module):
         self.has_relative_attention_bias = config.has_relative_attention_bias
         self.has_spatial_attention_bias = config.has_spatial_attention_bias
 
+    def cogview_attention(self, attention_scores, alpha=32):
+        """
+        https://huggingface.co/papers/2105.13290 Section 2.4 Stabilization of training: Precision Bottleneck Relaxation
+        (PB-Relax). A replacement of the original nn.Softmax(dim=-1)(attention_scores). Seems the new attention_probs
+        will result in a slower speed and a little bias. Can use torch.allclose(standard_attention_probs,
+        cogview_attention_probs, atol=1e-08) for comparison. The smaller atol (e.g., 1e-08), the better.
+        """
+        scaled_attention_scores = attention_scores / alpha
+        max_value = scaled_attention_scores.amax(dim=(-1)).unsqueeze(-1)
+        new_attention_scores = (scaled_attention_scores - max_value) * alpha
+        return nn.Softmax(dim=-1)(new_attention_scores)
+
     def forward(
         self,
         hidden_states,
@@ -224,9 +237,6 @@ class SuperDocSelfAttention(nn.Module):
         rel_pos=None,
         rel_2d_pos=None,
     ):
-        if output_attentions:
-            raise ValueError("output_attentions=True is not supported with triton flash attention")
-
         batch_size, seq_length, _ = hidden_states.shape
         query_layer = (
             self.query(hidden_states)
@@ -244,42 +254,28 @@ class SuperDocSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # Combine all biases into a single tensor for the triton kernel
-        # Shape: (batch, heads, seq_len, seq_len)
-        # Note: biases are added to scores AFTER QK^T is scaled by 1/sqrt(d),
-        # so biases should NOT be pre-scaled
+        # Compute attention bias (scaled by 1/√d to match LayoutLMv3)
+        scale = 1.0 / math.sqrt(self.attention_head_size)
+
         bias = None
-        if self.has_relative_attention_bias and rel_pos is not None:
-            bias = rel_pos
-        if self.has_spatial_attention_bias and rel_2d_pos is not None:
-            if bias is not None:
-                bias = bias + rel_2d_pos
-            else:
-                bias = rel_2d_pos
+        if self.has_relative_attention_bias and self.has_spatial_attention_bias:
+            bias = (rel_pos + rel_2d_pos) * scale
+        elif self.has_relative_attention_bias:
+            bias = rel_pos * scale
+
         if attention_mask is not None:
-            if bias is not None:
-                bias = bias + attention_mask
-            else:
-                bias = attention_mask.expand(batch_size, self.num_attention_heads, seq_length, seq_length)
+            bias = bias + attention_mask if bias is not None else attention_mask
 
-        # Call triton kernel
-        context_layer = flash_attention_with_bias(
-            query_layer,
-            key_layer,
-            value_layer,
-            bias=bias,
-            softmax_scale=1.0 / math.sqrt(self.attention_head_size),
-        )
-
-        # Apply dropout
-        if self.training and self.dropout.p > 0:
-            context_layer = self.dropout(context_layer)
+        # Use triton flash attention with fused bias
+        context_layer = flash_attention_with_bias(query_layer, key_layer, value_layer, bias, scale)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        return (context_layer,)
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+        return outputs
 
 
 class SuperDocSelfOutput(nn.Module):
