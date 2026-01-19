@@ -1,8 +1,7 @@
 """
 Triton Flash Attention with Bias support.
 
-Based on Flash-Attention-with-Bias-Triton (https://github.com/Dao-AILab/flash-attention-with-bias-triton)
-Adapted for SuperDoc's attention bias requirements.
+Based on Flash Attention algorithm with proper logsumexp saving for correct backward pass.
 """
 
 import torch
@@ -12,13 +11,14 @@ import triton.language as tl
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, Bias, Out,
+    Q, K, V, Bias, Out, LSE,  # LSE = logsumexp for backward
     softmax_scale,
     stride_qb, stride_qh, stride_qm, stride_qk,
     stride_kb, stride_kh, stride_kn, stride_kk,
     stride_vb, stride_vh, stride_vn, stride_vk,
     stride_bb, stride_bh, stride_bm, stride_bn,
     stride_ob, stride_oh, stride_om, stride_ok,
+    stride_lseb, stride_lseh, stride_lsem,
     seqlen_q, seqlen_k, headdim,
     HAVE_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_HEADDIM: tl.constexpr,
@@ -26,12 +26,6 @@ def _fwd_kernel(
     """Flash attention forward kernel with bias support."""
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
-    off_b = off_hb // stride_qh if stride_qh > 0 else off_hb
-    off_h = off_hb % stride_qh if stride_qh > 0 else 0
-
-    # Recompute off_b and off_h properly
-    off_b = tl.program_id(1) // tl.load(K + 0) if False else tl.program_id(1) // stride_bh if stride_bh > 0 else 0
-    # Simple version: assume off_hb encodes batch * num_heads linearly
 
     # Initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -110,6 +104,13 @@ def _fwd_kernel(
     # Final normalization
     acc = acc / l_i[:, None]
 
+    # Compute logsumexp for backward: LSE = m + log(l)
+    lse = m_i + tl.log(l_i)
+
+    # Store LSE
+    lse_ptrs = LSE + off_hb * stride_lseh + offs_m * stride_lsem
+    tl.store(lse_ptrs, lse, mask=offs_m < seqlen_q)
+
     # Store output
     out_ptrs = Out + off_hb * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
@@ -140,7 +141,7 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, Bias, DO, DQ, DK, DV, DBias, Delta,
+    Q, K, V, Bias, DO, DQ, DK, DV, DBias, LSE, Delta,
     softmax_scale,
     stride_qb, stride_qh, stride_qm, stride_qk,
     stride_kb, stride_kh, stride_kn, stride_kk,
@@ -151,12 +152,13 @@ def _bwd_kernel(
     stride_dkb, stride_dkh, stride_dkn, stride_dkk,
     stride_dvb, stride_dvh, stride_dvn, stride_dvk,
     stride_dbb, stride_dbh, stride_dbm, stride_dbn,
+    stride_lseb, stride_lseh, stride_lsem,
     stride_deltab, stride_deltah, stride_deltam,
     seqlen_q, seqlen_k, headdim,
     HAVE_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_HEADDIM: tl.constexpr,
 ):
-    """Flash attention backward kernel."""
+    """Flash attention backward kernel with correct global softmax."""
     start_n = tl.program_id(0)
     off_hb = tl.program_id(1)
 
@@ -179,16 +181,18 @@ def _bwd_kernel(
     for start_m in range(0, seqlen_q, BLOCK_M):
         offs_m_curr = start_m + offs_m
 
-        # Load Q, dO, Delta for this block
+        # Load Q, dO, LSE, Delta for this block
         q_ptrs = Q + off_hb * stride_qh + offs_m_curr[:, None] * stride_qm + offs_d[None, :] * stride_qk
         do_ptrs = DO + off_hb * stride_doh + offs_m_curr[:, None] * stride_dom + offs_d[None, :] * stride_dok
+        lse_ptrs = LSE + off_hb * stride_lseh + offs_m_curr * stride_lsem
         delta_ptrs = Delta + off_hb * stride_deltah + offs_m_curr * stride_deltam
 
         q = tl.load(q_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
+        lse = tl.load(lse_ptrs, mask=offs_m_curr < seqlen_q, other=0.0)
         delta = tl.load(delta_ptrs, mask=offs_m_curr < seqlen_q, other=0.0)
 
-        # Recompute attention: QK^T
+        # Recompute attention scores: QK^T * scale
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk = tl.dot(q * softmax_scale, tl.trans(k), qk)
 
@@ -200,42 +204,41 @@ def _bwd_kernel(
                           other=0.0)
             qk = qk + bias
 
-        # Mask and compute softmax
-        qk = tl.where(
-            (offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
-            qk, float("-inf")
-        )
-        p = tl.exp(qk - tl.max(qk, axis=1)[:, None])
-        p = p / tl.sum(p, axis=1)[:, None]
+        # Compute CORRECT softmax using saved LSE (global normalization)
+        # P = exp(scores - LSE)
+        p = tl.exp(qk - lse[:, None])
+
+        # Mask out-of-bounds positions
         p = tl.where(
             (offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
             p, 0.0
         )
 
-        # Compute dV
+        # Compute dV: dV += P^T @ dO
         p_f16 = p.to(do.dtype)
         dv = dv + tl.dot(tl.trans(p_f16), do)
 
-        # Compute dP
+        # Compute dP: dP = dO @ V^T
         dp = tl.dot(do, tl.trans(v))
 
         # Compute dS = P * (dP - Delta)
+        # This is the gradient through softmax
         ds = p * (dp - delta[:, None])
 
-        # Compute dBias BEFORE scaling ds (dBias = dS, not dS * scale)
+        # Compute dBias (before scaling)
         if HAVE_BIAS:
             dbias_ptrs = DBias + off_hb * stride_dbh + offs_m_curr[:, None] * stride_dbm + offs_n[None, :] * stride_dbn
             tl.atomic_add(dbias_ptrs, ds,
                          mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k))
 
-        # Scale for dQ and dK computation
+        # Scale ds for dQ and dK (because forward scaled Q)
         ds = ds * softmax_scale
 
-        # Compute dK
+        # Compute dK: dK += dS^T @ Q
         ds_f16 = ds.to(q.dtype)
         dk = dk + tl.dot(tl.trans(ds_f16), q)
 
-        # Compute dQ
+        # Compute dQ: dQ += dS @ K
         dq = tl.dot(ds_f16, k)
         dq_ptrs = DQ + off_hb * stride_dqh + offs_m_curr[:, None] * stride_dqm + offs_d[None, :] * stride_dqk
         tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
@@ -278,6 +281,8 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
             bias = bias.contiguous()
 
         out = torch.empty_like(q)
+        # LSE: logsumexp values for backward, shape (batch, nheads, seqlen_q)
+        lse = torch.empty(batch, nheads, seqlen_q, device=q.device, dtype=torch.float32)
 
         # Block sizes
         BLOCK_M = 64
@@ -288,7 +293,7 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
         grid = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
 
         _fwd_kernel[grid](
-            q, k, v, bias, out,
+            q, k, v, bias, out, lse,
             softmax_scale,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -298,12 +303,13 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
             bias.stride(2) if bias is not None else 0,
             bias.stride(3) if bias is not None else 0,
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
             seqlen_q, seqlen_k, headdim,
             HAVE_BIAS=bias is not None,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_HEADDIM=BLOCK_HEADDIM,
         )
 
-        ctx.save_for_backward(q, k, v, bias, out)
+        ctx.save_for_backward(q, k, v, bias, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.BLOCK_M = BLOCK_M
         ctx.BLOCK_N = BLOCK_N
@@ -314,7 +320,7 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         """Backward pass."""
-        q, k, v, bias, out = ctx.saved_tensors
+        q, k, v, bias, out, lse = ctx.saved_tensors
         softmax_scale = ctx.softmax_scale
         BLOCK_M = ctx.BLOCK_M
         BLOCK_N = ctx.BLOCK_N
@@ -347,7 +353,7 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
         # Backward kernel
         grid_bwd = (triton.cdiv(seqlen_k, BLOCK_N), batch * nheads)
         _bwd_kernel[grid_bwd](
-            q, k, v, bias, do, dq, dk, dv, dbias, delta,
+            q, k, v, bias, do, dq, dk, dv, dbias, lse, delta,
             softmax_scale,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -364,6 +370,7 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
             dbias.stride(1) if dbias is not None else 0,
             dbias.stride(2) if dbias is not None else 0,
             dbias.stride(3) if dbias is not None else 0,
+            lse.stride(0), lse.stride(1), lse.stride(2),
             delta.stride(0), delta.stride(1), delta.stride(2),
             seqlen_q, seqlen_k, headdim,
             HAVE_BIAS=bias is not None,
