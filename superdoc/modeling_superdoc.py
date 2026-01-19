@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .triton_flash_attn import flash_attention_with_bias
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
@@ -252,29 +254,20 @@ class SuperDocSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        # The attention scores QT K/√d could be significantly larger than input elements, and result in overflow.
-        # Changing the computational order into QT(K/√d) alleviates the problem. (https://arxiv.org/abs/2105.13290)
-        attention_scores = torch.matmul(query_layer / math.sqrt(self.attention_head_size), key_layer.transpose(-1, -2))
+        # Compute attention bias (scaled by 1/√d to match LayoutLMv3)
+        scale = 1.0 / math.sqrt(self.attention_head_size)
 
+        bias = None
         if self.has_relative_attention_bias and self.has_spatial_attention_bias:
-            attention_scores += (rel_pos + rel_2d_pos) / math.sqrt(self.attention_head_size)
+            bias = (rel_pos + rel_2d_pos) * scale
         elif self.has_relative_attention_bias:
-            attention_scores += rel_pos / math.sqrt(self.attention_head_size)
+            bias = rel_pos * scale
 
         if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in RobertaModel forward() function)
-            attention_scores = attention_scores + attention_mask
+            bias = bias + attention_mask if bias is not None else attention_mask
 
-        # Normalize the attention scores to probabilities.
-        # Use the trick of the CogView paper to stabilize training
-        attention_probs = self.cogview_attention(attention_scores)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        context_layer = torch.matmul(attention_probs, value_layer)
+        # Use triton flash attention with fused bias
+        context_layer = flash_attention_with_bias(query_layer, key_layer, value_layer, bias, scale)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
