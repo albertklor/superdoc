@@ -1103,11 +1103,9 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.layoutlmv3.set_input_embeddings(value)
 
-    def get_output_embeddings(self):
-        return self.mlm_head[-1]
-
-    def set_output_embeddings(self, new_embeddings):
-        self.mlm_head[-1] = new_embeddings
+    def tie_weights(self):
+        """Override to prevent automatic weight tying between embeddings and MLM head."""
+        pass
 
     def forward(
         self,
