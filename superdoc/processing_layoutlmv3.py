@@ -1,4 +1,4 @@
-"""Processor class for SuperDoc."""
+"""Processor class for LayoutLMv3."""
 
 from typing import Optional, Union
 
@@ -7,28 +7,29 @@ from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy,
 from transformers.utils import TensorType
 
 
-class SuperDocProcessor(ProcessorMixin):
+class LayoutLMv3Processor(ProcessorMixin):
     r"""
-    Constructs a SuperDoc processor which combines a SuperDoc image processor and a SuperDoc tokenizer into a
+    Constructs a LayoutLMv3 processor which combines a LayoutLMv3 image processor and a LayoutLMv3 tokenizer into a
     single processor.
 
-    [`SuperDocProcessor`] offers all the functionalities you need to prepare data for the model.
+    [`LayoutLMv3Processor`] offers all the functionalities you need to prepare data for the model.
 
-    It first uses [`SuperDocImageProcessor`] to resize and normalize document images. The words and bounding boxes
-    must be provided by the user. These are then provided to [`SuperDocTokenizer`] or [`SuperDocTokenizerFast`],
-    which turns the words and bounding boxes into token-level `input_ids`, `attention_mask`, `token_type_ids`, `bbox`.
+    It first uses [`LayoutLMv3ImageProcessor`] to resize and normalize document images. The words and bounding boxes
+    must be provided by the user. These are then provided to [`LayoutLMv3Tokenizer`] or [`LayoutLMv3TokenizerFast`],
+    which turns the words and bounding boxes into token-level `input_ids`, `attention_mask`, `bbox`.
     Optionally, one can provide integer `word_labels`, which are turned into token-level `labels` for token
     classification tasks (such as FUNSD, CORD).
 
     Args:
-        image_processor (`SuperDocImageProcessor`, *optional*):
-            An instance of [`SuperDocImageProcessor`]. The image processor is a required input.
-        tokenizer (`SuperDocTokenizer` or `SuperDocTokenizerFast`, *optional*):
-            An instance of [`SuperDocTokenizer`] or [`SuperDocTokenizerFast`]. The tokenizer is a required input.
+        image_processor (`LayoutLMv3ImageProcessor`, *optional*):
+            An instance of [`LayoutLMv3ImageProcessor`]. The image processor is a required input.
+        tokenizer (`LayoutLMv3Tokenizer` or `LayoutLMv3TokenizerFast`, *optional*):
+            An instance of [`LayoutLMv3Tokenizer`] or [`LayoutLMv3TokenizerFast`]. The tokenizer is a required input.
     """
 
-    def __init__(self, image_processor=None, tokenizer=None, **kwargs):
+    def __init__(self, image_processor=None, tokenizer=None, subword_positions=True, **kwargs):
         super().__init__(image_processor, tokenizer)
+        self.subword_positions = subword_positions
 
     def __call__(
         self,
@@ -54,9 +55,9 @@ class SuperDocProcessor(ProcessorMixin):
         **kwargs,
     ) -> BatchEncoding:
         """
-        This method first forwards the `images` argument to [`~SuperDocImageProcessor.__call__`] to get resized and
+        This method first forwards the `images` argument to [`~LayoutLMv3ImageProcessor.__call__`] to get resized and
         normalized `pixel_values`. It then passes the words (`text`/`text_pair`) and `boxes` to
-        [`~SuperDocTokenizer.__call__`] and returns the output together with the pixel values.
+        [`~LayoutLMv3Tokenizer.__call__`] and returns the output together with the pixel values.
 
         Please refer to the docstring of the above two methods for more information.
 
@@ -64,7 +65,7 @@ class SuperDocProcessor(ProcessorMixin):
             images: The document images to process.
             text: The words/text to tokenize.
             text_pair: Optional second sequence for sequence pairs.
-            boxes: The bounding boxes corresponding to the words (normalized to 0-1000 scale).
+            boxes: The bounding boxes corresponding to the words (normalized to 0-max_2d_position_embeddings-1).
             word_labels: Optional word-level labels for token classification tasks.
         """
         if boxes is None:
@@ -102,7 +103,36 @@ class SuperDocProcessor(ProcessorMixin):
             images = self.get_overflowing_images(images, encoded_inputs["overflow_to_sample_mapping"])
         encoded_inputs["pixel_values"] = images
 
+        # Compute subword positions if enabled
+        if self.subword_positions:
+            encoded_inputs["position_ids"] = self._compute_subword_positions(encoded_inputs)
+
         return encoded_inputs
+
+    def _compute_subword_positions(self, encoded_inputs):
+        """Position within word (same bbox = same word)."""
+        input_ids = encoded_inputs["input_ids"]
+        bbox = encoded_inputs["bbox"]
+
+        # Handle single vs batched
+        if not isinstance(input_ids[0], list):
+            input_ids = [input_ids]
+            bbox = [bbox]
+
+        position_ids = []
+        for ids, boxes in zip(input_ids, bbox):
+            positions = []
+            pos, prev_box = 0, None
+            for i, box in enumerate(boxes):
+                box_tuple = tuple(box)
+                if box_tuple != prev_box:
+                    pos = 0
+                    prev_box = box_tuple
+                positions.append(pos)
+                pos += 1
+            position_ids.append(positions)
+
+        return position_ids if len(position_ids) > 1 else position_ids[0]
 
     def get_overflowing_images(self, images, overflow_to_sample_mapping):
         # In case there's an overflow, ensure each `input_ids` sample is mapped to its corresponding image
@@ -120,7 +150,7 @@ class SuperDocProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        return ["input_ids", "bbox", "attention_mask", "pixel_values"]
+        return ["input_ids", "bbox", "attention_mask", "pixel_values", "position_ids"]
 
 
-__all__ = ["SuperDocProcessor"]
+__all__ = ["LayoutLMv3Processor"]

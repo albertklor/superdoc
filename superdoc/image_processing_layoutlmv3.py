@@ -34,9 +34,9 @@ logger = logging.get_logger(__name__)
 
 
 @requires(backends=("vision",))
-class SuperDocImageProcessor(BaseImageProcessor):
+class LayoutLMv3ImageProcessor(BaseImageProcessor):
     r"""
-    Constructs a SuperDoc image processor.
+    Constructs a LayoutLMv3 image processor.
 
     Args:
         do_resize (`bool`, *optional*, defaults to `True`):
@@ -259,4 +259,4 @@ class SuperDocImageProcessor(BaseImageProcessor):
         return data
 
 
-__all__ = ["SuperDocImageProcessor"]
+__all__ = ["LayoutLMv3ImageProcessor"]

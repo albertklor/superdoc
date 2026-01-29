@@ -5,19 +5,19 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class SuperDocConfig(PretrainedConfig):
+class LayoutLMv3Config(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`SuperDocModel`]. It is used to instantiate a
-    SuperDoc model according to the specified arguments, defining the model architecture. Instantiating a
-    configuration with the defaults will yield a similar configuration to that of the SuperDoc architecture.
+    This is the configuration class to store the configuration of a [`LayoutLMv3Model`]. It is used to instantiate a
+    LayoutLMv3 model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of the LayoutLMv3 architecture.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
         vocab_size (`int`, *optional*, defaults to 50368):
-            Vocabulary size of the SuperDoc model. Defines the number of different tokens that can be represented by
-            the `inputs_ids` passed when calling [`SuperDocModel`].
+            Vocabulary size of the LayoutLMv3 model. Defines the number of different tokens that can be represented by
+            the `inputs_ids` passed when calling [`LayoutLMv3Model`].
         hidden_size (`int`, *optional*, defaults to 768):
             Dimension of the encoder layers and the pooler layer.
         num_hidden_layers (`int`, *optional*, defaults to 22):
@@ -36,8 +36,6 @@ class SuperDocConfig(PretrainedConfig):
         max_position_embeddings (`int`, *optional*, defaults to 8192):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
-        type_vocab_size (`int`, *optional*, defaults to 2):
-            The vocabulary size of the `token_type_ids` passed when calling [`SuperDocModel`].
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         layer_norm_eps (`float`, *optional*, defaults to 1e-5):
@@ -75,13 +73,13 @@ class SuperDocConfig(PretrainedConfig):
     Example:
 
     ```python
-    >>> from layoutlmv3 import SuperDocConfig, SuperDocModel
+    >>> from layoutlmv3 import LayoutLMv3Config, LayoutLMv3Model
 
-    >>> # Initializing a SuperDoc configuration
-    >>> configuration = SuperDocConfig()
+    >>> # Initializing a LayoutLMv3 configuration
+    >>> configuration = LayoutLMv3Config()
 
-    >>> # Initializing a model (with random weights) from the SuperDoc configuration
-    >>> model = SuperDocModel(configuration)
+    >>> # Initializing a model (with random weights) from the LayoutLMv3 configuration
+    >>> model = LayoutLMv3Model(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -100,7 +98,6 @@ class SuperDocConfig(PretrainedConfig):
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
         max_position_embeddings=512,
-        type_vocab_size=2,
         initializer_range=0.02,
         layer_norm_eps=1e-5,
         pad_token_id=50283,
@@ -138,7 +135,6 @@ class SuperDocConfig(PretrainedConfig):
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.max_position_embeddings = max_position_embeddings
-        self.type_vocab_size = type_vocab_size
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
         self.max_2d_position_embeddings = max_2d_position_embeddings
@@ -158,4 +154,4 @@ class SuperDocConfig(PretrainedConfig):
         self.classifier_dropout = classifier_dropout
 
 
-__all__ = ["SuperDocConfig"]
+__all__ = ["LayoutLMv3Config"]

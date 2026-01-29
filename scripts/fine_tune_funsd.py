@@ -6,12 +6,12 @@ from datasets import Features, Sequence, Value, Array2D, Array3D, load_dataset
 from evaluate import load as load_metric
 from transformers import AutoProcessor, Trainer, TrainingArguments
 from transformers.data.data_collator import default_data_collator
-from superdoc import SuperDocConfig, SuperDocForTokenClassification
+from superdoc import LayoutLMv3Config, LayoutLMv3ForTokenClassification
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_path", type=str, default="albertklorer/superdoc-base")
+    parser.add_argument("--hf_path", type=str, default="albertklorer/layoutlmv3-base")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -24,22 +24,22 @@ def parse_args():
 def main():
     args = parse_args()
 
-    wandb.init(project="superdoc-funsd-fine-tune", config=vars(args))
+    wandb.init(project="layoutlmv3-funsd-fine-tune", config=vars(args))
 
     dataset = load_dataset("nielsr/funsd-layoutlmv3")
     label_list = dataset["train"].features["ner_tags"].feature.names
     id2label = {
-        i: l for 
-        i, l in 
+        i: l for
+        i, l in
         enumerate(label_list)
     }
     label2id = {
-        l: i 
-        for i, l 
+        l: i
+        for i, l
         in enumerate(label_list)
     }
 
-    config = SuperDocConfig.from_pretrained(args.hf_path, num_labels=len(label_list), id2label=id2label, label2id=label2id)
+    config = LayoutLMv3Config.from_pretrained(args.hf_path, num_labels=len(label_list), id2label=id2label, label2id=label2id)
     processor = AutoProcessor.from_pretrained(args.hf_path, apply_ocr=False)
 
     def prepare_examples(examples):
@@ -69,7 +69,7 @@ def main():
     train_dataset.set_format("torch")
     eval_dataset.set_format("torch")
 
-    model = SuperDocForTokenClassification.from_pretrained(args.hf_path, config=config)
+    model = LayoutLMv3ForTokenClassification.from_pretrained(args.hf_path, config=config)
 
     metric = load_metric("seqeval")
 

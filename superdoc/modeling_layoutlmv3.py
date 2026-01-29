@@ -14,22 +14,25 @@ except ImportError:
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutput,
+    ModelOutput,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
+from dataclasses import dataclass
+from typing import Optional
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import apply_chunking_to_forward
 from transformers.utils import logging
 
-from .configuration_superdoc import SuperDocConfig
+from .configuration_layoutlmv3 import LayoutLMv3Config
 
 
 logger = logging.get_logger(__name__)
 
 
-class SuperDocPatchEmbeddings(nn.Module):
-    """SuperDoc image (patch) embeddings. This class also automatically interpolates the position embeddings for varying
+class LayoutLMv3PatchEmbeddings(nn.Module):
+    """LayoutLMv3 image (patch) embeddings. This class also automatically interpolates the position embeddings for varying
     image sizes."""
 
     def __init__(self, config):
@@ -63,15 +66,14 @@ class SuperDocPatchEmbeddings(nn.Module):
         return embeddings
 
 
-class SuperDocTextEmbeddings(nn.Module):
+class LayoutLMv3TextEmbeddings(nn.Module):
     """
-    SuperDoc text embeddings. Same as `RobertaEmbeddings` but with added spatial (layout) embeddings.
+    LayoutLMv3 text embeddings. Same as `RobertaEmbeddings` but with added spatial (layout) embeddings.
     """
 
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -121,7 +123,6 @@ class SuperDocTextEmbeddings(nn.Module):
         Replace non-padding symbols with their position numbers. Position numbers begin at padding_idx+1. Padding
         symbols are ignored. This is modified from fairseq's `utils.make_positions`.
         """
-        # The series of casts and type-conversions here are carefully balanced to both work with ONNX export and XLA.
         mask = input_ids.ne(padding_idx).int()
         incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask
         return incremental_indices.long() + padding_idx
@@ -142,7 +143,6 @@ class SuperDocTextEmbeddings(nn.Module):
         self,
         input_ids=None,
         bbox=None,
-        token_type_ids=None,
         position_ids=None,
         inputs_embeds=None,
     ):
@@ -155,24 +155,14 @@ class SuperDocTextEmbeddings(nn.Module):
             else:
                 position_ids = self.create_position_ids_from_inputs_embeds(inputs_embeds)
 
-        if input_ids is not None:
-            input_shape = input_ids.size()
-        else:
-            input_shape = inputs_embeds.size()[:-1]
-
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
-        embeddings = inputs_embeds + token_type_embeddings
+        embeddings = inputs_embeds
         position_embeddings = self.position_embeddings(position_ids)
-        embeddings += position_embeddings
+        embeddings = embeddings + position_embeddings
 
         spatial_position_embeddings = self.calculate_spatial_position_embeddings(bbox)
-
         embeddings = embeddings + spatial_position_embeddings
 
         embeddings = self.LayerNorm(embeddings)
@@ -180,9 +170,9 @@ class SuperDocTextEmbeddings(nn.Module):
         return embeddings
 
 
-class SuperDocPreTrainedModel(PreTrainedModel):
-    config_class = SuperDocConfig
-    base_model_prefix = "superdoc"
+class LayoutLMv3PreTrainedModel(PreTrainedModel):
+    config_class = LayoutLMv3Config
+    base_model_prefix = "layoutlmv3"
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -199,7 +189,7 @@ class SuperDocPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 
-class SuperDocSelfAttention(nn.Module):
+class LayoutLMv3SelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
@@ -285,7 +275,7 @@ class SuperDocSelfAttention(nn.Module):
         return (context_layer, attention_probs) if output_attentions else (context_layer,)
 
 
-class SuperDocSelfOutput(nn.Module):
+class LayoutLMv3SelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
@@ -299,11 +289,11 @@ class SuperDocSelfOutput(nn.Module):
         return hidden_states
 
 
-class SuperDocAttention(nn.Module):
+class LayoutLMv3Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.self = SuperDocSelfAttention(config)
-        self.output = SuperDocSelfOutput(config)
+        self.self = LayoutLMv3SelfAttention(config)
+        self.output = LayoutLMv3SelfOutput(config)
 
     def forward(
         self,
@@ -325,7 +315,7 @@ class SuperDocAttention(nn.Module):
         return outputs
 
 
-class SuperDocIntermediate(nn.Module):
+class LayoutLMv3Intermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
@@ -340,7 +330,7 @@ class SuperDocIntermediate(nn.Module):
         return hidden_states
 
 
-class SuperDocOutput(nn.Module):
+class LayoutLMv3Output(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
@@ -354,14 +344,14 @@ class SuperDocOutput(nn.Module):
         return hidden_states
 
 
-class SuperDocLayer(nn.Module):
+class LayoutLMv3Layer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward if hasattr(config, 'chunk_size_feed_forward') else 0
         self.seq_len_dim = 1
-        self.attention = SuperDocAttention(config)
-        self.intermediate = SuperDocIntermediate(config)
-        self.output = SuperDocOutput(config)
+        self.attention = LayoutLMv3Attention(config)
+        self.intermediate = LayoutLMv3Intermediate(config)
+        self.output = LayoutLMv3Output(config)
 
     def forward(
         self,
@@ -395,11 +385,11 @@ class SuperDocLayer(nn.Module):
         return layer_output
 
 
-class SuperDocEncoder(nn.Module):
+class LayoutLMv3Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([SuperDocLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([LayoutLMv3Layer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.has_relative_attention_bias = config.has_relative_attention_bias
@@ -547,18 +537,18 @@ class SuperDocEncoder(nn.Module):
         )
 
 
-class SuperDocModel(SuperDocPreTrainedModel):
+class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
 
         if config.text_embed:
-            self.embeddings = SuperDocTextEmbeddings(config)
+            self.embeddings = LayoutLMv3TextEmbeddings(config)
 
         if config.visual_embed:
             # use the default pre-training parameters for fine-tuning (e.g., input_size)
             # when the input_size is larger in fine-tuning, we will interpolate the position embeddings in forward
-            self.patch_embed = SuperDocPatchEmbeddings(config)
+            self.patch_embed = LayoutLMv3PatchEmbeddings(config)
 
             self.size = int(config.input_size / config.patch_size)
             self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -575,7 +565,7 @@ class SuperDocModel(SuperDocPreTrainedModel):
 
             self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
 
-        self.encoder = SuperDocEncoder(config)
+        self.encoder = LayoutLMv3Encoder(config)
 
         self.post_init()
 
@@ -652,7 +642,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         bbox: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
-        token_type_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
@@ -684,8 +673,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
         if input_ids is not None or inputs_embeds is not None:
             if attention_mask is None:
                 attention_mask = torch.ones(((batch_size, seq_length)), device=device)
-            if token_type_ids is None:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
             if bbox is None:
                 bbox = torch.zeros(tuple(list(input_shape) + [4]), dtype=torch.long, device=device)
 
@@ -693,7 +680,6 @@ class SuperDocModel(SuperDocPreTrainedModel):
                 input_ids=input_ids,
                 bbox=bbox,
                 position_ids=position_ids,
-                token_type_ids=token_type_ids,
                 inputs_embeds=inputs_embeds,
             )
 
@@ -774,7 +760,7 @@ class SuperDocModel(SuperDocPreTrainedModel):
         )
 
 
-class SuperDocClassificationHead(nn.Module):
+class LayoutLMv3ClassificationHead(nn.Module):
     """
     Head for sentence-level classification tasks. Reference: RobertaClassificationHead
     """
@@ -801,32 +787,31 @@ class SuperDocClassificationHead(nn.Module):
         return x
 
 
-class SuperDocForTokenClassification(SuperDocPreTrainedModel):
+class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.superdoc = SuperDocModel(config)
+        self.layoutlmv3 = LayoutLMv3Model(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         if config.num_labels < 10:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
-            self.classifier = SuperDocClassificationHead(config, pool_feature=False)
+            self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.superdoc.get_input_embeddings()
+        return self.layoutlmv3.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.superdoc.set_input_embeddings(value)
+        self.layoutlmv3.set_input_embeddings(value)
 
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         bbox: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
-        token_type_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
@@ -838,11 +823,10 @@ class SuperDocForTokenClassification(SuperDocPreTrainedModel):
     ) -> tuple | TokenClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.superdoc(
+        outputs = self.layoutlmv3(
             input_ids,
             bbox=bbox,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -878,27 +862,26 @@ class SuperDocForTokenClassification(SuperDocPreTrainedModel):
         )
 
 
-class SuperDocForQuestionAnswering(SuperDocPreTrainedModel):
+class LayoutLMv3ForQuestionAnswering(LayoutLMv3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.superdoc = SuperDocModel(config)
-        self.qa_outputs = SuperDocClassificationHead(config, pool_feature=False)
+        self.layoutlmv3 = LayoutLMv3Model(config)
+        self.qa_outputs = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.superdoc.get_input_embeddings()
+        return self.layoutlmv3.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.superdoc.set_input_embeddings(value)
+        self.layoutlmv3.set_input_embeddings(value)
 
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
-        token_type_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         start_positions: torch.LongTensor | None = None,
@@ -912,10 +895,9 @@ class SuperDocForQuestionAnswering(SuperDocPreTrainedModel):
     ) -> tuple | QuestionAnsweringModelOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.superdoc(
+        outputs = self.layoutlmv3(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -962,27 +944,26 @@ class SuperDocForQuestionAnswering(SuperDocPreTrainedModel):
         )
 
 
-class SuperDocForSequenceClassification(SuperDocPreTrainedModel):
+class LayoutLMv3ForSequenceClassification(LayoutLMv3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.config = config
-        self.superdoc = SuperDocModel(config)
-        self.classifier = SuperDocClassificationHead(config, pool_feature=False)
+        self.layoutlmv3 = LayoutLMv3Model(config)
+        self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.superdoc.get_input_embeddings()
+        return self.layoutlmv3.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.superdoc.set_input_embeddings(value)
+        self.layoutlmv3.set_input_embeddings(value)
 
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
-        token_type_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
@@ -995,10 +976,9 @@ class SuperDocForSequenceClassification(SuperDocPreTrainedModel):
     ) -> tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.superdoc(
+        outputs = self.layoutlmv3(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -1046,11 +1026,213 @@ class SuperDocForSequenceClassification(SuperDocPreTrainedModel):
         )
 
 
+@dataclass
+class LayoutLMv3PreTrainingOutput(ModelOutput):
+    """
+    Output type of [`LayoutLMv3ForPreTraining`].
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Total pretraining loss (weighted sum of MLM, IRR, and WPA losses).
+        mlm_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Masked language modeling loss.
+        irr_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Image region replacement loss.
+        wpa_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Word patch alignment loss.
+        mlm_logits (`torch.FloatTensor` of shape `(batch_size, seq_len, vocab_size)`):
+            Prediction scores of the MLM head.
+        irr_logits (`torch.FloatTensor` of shape `(batch_size, num_patches)`):
+            Prediction scores of the IRR head (binary per patch).
+        wpa_logits (`torch.FloatTensor` of shape `(batch_size, seq_len)`):
+            Prediction scores of the WPA head (binary per token).
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    mlm_loss: Optional[torch.FloatTensor] = None
+    irr_loss: Optional[torch.FloatTensor] = None
+    wpa_loss: Optional[torch.FloatTensor] = None
+    mlm_logits: torch.FloatTensor = None
+    irr_logits: torch.FloatTensor = None
+    wpa_logits: torch.FloatTensor = None
+
+
+class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
+    """
+    LayoutLMv3 model with pretraining heads for:
+    - MLM: Masked Language Modeling (whole word masking)
+    - IRR: Image Region Replacement (predict which patches were replaced)
+    - WPA: Word Patch Alignment (predict if word center overlaps replaced patch)
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.layoutlmv3 = LayoutLMv3Model(config)
+
+        # MLM Head: [batch, seq_len, hidden_size] -> [batch, seq_len, vocab_size]
+        self.mlm_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, config.vocab_size),
+        )
+
+        # IRR Head: [batch, hidden_size] (CLS token) -> [batch, num_patches]
+        # num_patches = (input_size / patch_size)^2 = (224/16)^2 = 196
+        num_patches = (config.input_size // config.patch_size) ** 2
+        self.irr_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, num_patches),
+        )
+
+        # WPA Head: [batch, seq_len, hidden_size] -> [batch, seq_len]
+        self.wpa_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, 1),
+        )
+
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.layoutlmv3.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.layoutlmv3.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.mlm_head[-1]
+
+    def set_output_embeddings(self, new_embeddings):
+        self.mlm_head[-1] = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        bbox: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        mlm_labels: torch.LongTensor | None = None,
+        irr_labels: torch.FloatTensor | None = None,
+        wpa_labels: torch.FloatTensor | None = None,
+        mlm_weight: float = 1.0,
+        irr_weight: float = 1.0,
+        wpa_weight: float = 1.0,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple | LayoutLMv3PreTrainingOutput:
+        """
+        Args:
+            mlm_labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Labels for MLM. Positions with -100 are ignored. Other values are token ids.
+            irr_labels (`torch.FloatTensor` of shape `(batch_size, num_patches)`, *optional*):
+                Labels for IRR. 1 for replaced patches, 0 for original.
+            wpa_labels (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Labels for WPA. 1 if token's bbox center is in a replaced patch, 0 otherwise.
+                Positions with -100 are ignored.
+            mlm_weight (`float`, *optional*, defaults to 1.0):
+                Weight for MLM loss.
+            irr_weight (`float`, *optional*, defaults to 1.0):
+                Weight for IRR loss.
+            wpa_weight (`float`, *optional*, defaults to 1.0):
+                Weight for WPA loss.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.layoutlmv3(
+            input_ids,
+            bbox=bbox,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            pixel_values=pixel_values,
+        )
+
+        sequence_output = outputs[0]
+
+        # Get sequence length (text portion)
+        if input_ids is not None:
+            seq_length = input_ids.size(1)
+        else:
+            seq_length = inputs_embeds.size(1)
+
+        # Text portion: [batch, seq_len, hidden_size]
+        text_output = sequence_output[:, :seq_length, :]
+
+        # Visual CLS token: [batch, hidden_size] (first token after text)
+        visual_cls = sequence_output[:, seq_length, :]
+
+        # Compute logits for each head
+        mlm_logits = self.mlm_head(text_output)  # [batch, seq_len, vocab_size]
+        irr_logits = self.irr_head(visual_cls)   # [batch, num_patches]
+        wpa_logits = self.wpa_head(text_output).squeeze(-1)  # [batch, seq_len]
+
+        # Compute losses
+        total_loss = None
+        mlm_loss = None
+        irr_loss = None
+        wpa_loss = None
+
+        if mlm_labels is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            mlm_loss = loss_fct(mlm_logits.view(-1, self.config.vocab_size), mlm_labels.view(-1))
+
+        if irr_labels is not None:
+            loss_fct = BCEWithLogitsLoss()
+            irr_loss = loss_fct(irr_logits, irr_labels.float())
+
+        if wpa_labels is not None:
+            # Create mask for valid positions (not -100)
+            wpa_mask = wpa_labels != -100
+            if wpa_mask.any():
+                loss_fct = BCEWithLogitsLoss()
+                # Only compute loss on valid positions
+                valid_logits = wpa_logits[wpa_mask]
+                valid_labels = wpa_labels[wpa_mask].float()
+                wpa_loss = loss_fct(valid_logits, valid_labels)
+
+        # Combine losses
+        losses = []
+        if mlm_loss is not None:
+            losses.append(mlm_weight * mlm_loss)
+        if irr_loss is not None:
+            losses.append(irr_weight * irr_loss)
+        if wpa_loss is not None:
+            losses.append(wpa_weight * wpa_loss)
+        total_loss = sum(losses) if losses else None
+
+        if not return_dict:
+            output = (mlm_logits, irr_logits, wpa_logits) + outputs[1:]
+            return ((total_loss, mlm_loss, irr_loss, wpa_loss) + output) if total_loss is not None else output
+
+        return LayoutLMv3PreTrainingOutput(
+            loss=total_loss,
+            mlm_loss=mlm_loss,
+            irr_loss=irr_loss,
+            wpa_loss=wpa_loss,
+            mlm_logits=mlm_logits,
+            irr_logits=irr_logits,
+            wpa_logits=wpa_logits,
+        )
+
+
 __all__ = [
-    "SuperDocConfig",
-    "SuperDocForQuestionAnswering",
-    "SuperDocForSequenceClassification",
-    "SuperDocForTokenClassification",
-    "SuperDocModel",
-    "SuperDocPreTrainedModel",
+    "LayoutLMv3Config",
+    "LayoutLMv3ForPreTraining",
+    "LayoutLMv3ForQuestionAnswering",
+    "LayoutLMv3ForSequenceClassification",
+    "LayoutLMv3ForTokenClassification",
+    "LayoutLMv3Model",
+    "LayoutLMv3PreTrainedModel",
+    "LayoutLMv3PreTrainingOutput",
 ]

@@ -25,7 +25,7 @@ VOCAB_FILES_NAMES = {
 }
 
 # Docstring constants for encode methods
-SUPERDOC_ENCODE_KWARGS_DOCSTRING = r"""
+LAYOUTLMV3_ENCODE_KWARGS_DOCSTRING = r"""
             add_special_tokens (`bool`, *optional*, defaults to `True`):
                 Whether or not to encode the sequences with the special tokens relative to their model.
             padding (`bool`, `str` or [`~file_utils.PaddingStrategy`], *optional*, defaults to `False`):
@@ -68,7 +68,7 @@ SUPERDOC_ENCODE_KWARGS_DOCSTRING = r"""
                 the use of Tensor Cores on NVIDIA hardware with compute capability `>= 7.5` (Volta).
 """
 
-SUPERDOC_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING = r"""
+LAYOUTLMV3_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING = r"""
             return_token_type_ids (`bool`, *optional*):
                 Whether to return token type IDs. If left to the default, will return the token type IDs according to
                 the specific tokenizer's default, defined by the `return_outputs` attribute.
@@ -98,9 +98,9 @@ SUPERDOC_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING = r"""
 """
 
 
-class SuperDocTokenizer(PreTrainedTokenizerFast):
+class LayoutLMv3Tokenizer(PreTrainedTokenizerFast):
     r"""
-    Construct a SuperDoc tokenizer (backed by HuggingFace's *tokenizers* library). Based on byte-level BPE.
+    Construct a LayoutLMv3 tokenizer (backed by HuggingFace's *tokenizers* library). Based on byte-level BPE.
 
     This tokenizer inherits from [`PreTrainedTokenizerFast`] which contains most of the main methods. Users should
     refer to this superclass for more information regarding those methods.
@@ -224,7 +224,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
         self.pad_token_label = pad_token_label
         self.only_label_first_subword = only_label_first_subword
 
-    @add_end_docstrings(SUPERDOC_ENCODE_KWARGS_DOCSTRING, SUPERDOC_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
+    @add_end_docstrings(LAYOUTLMV3_ENCODE_KWARGS_DOCSTRING, LAYOUTLMV3_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
     def __call__(
         self,
         text: Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]],
@@ -261,7 +261,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
                 The sequence or batch of sequences to be encoded. Each sequence should be a list of strings
                 (pretokenized string).
             boxes (`List[List[int]]`, `List[List[List[int]]]`):
-                Word-level bounding boxes. Each bounding box should be normalized to be on a 0-1000 scale.
+                Word-level bounding boxes. Each bounding box should be normalized to 0-(max_2d_position_embeddings-1).
             word_labels (`List[int]`, `List[List[int]]`, *optional*):
                 Word-level integer labels (for token classification tasks such as FUNSD, CORD).
         """
@@ -376,7 +376,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
                 **kwargs,
             )
 
-    @add_end_docstrings(SUPERDOC_ENCODE_KWARGS_DOCSTRING, SUPERDOC_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
+    @add_end_docstrings(LAYOUTLMV3_ENCODE_KWARGS_DOCSTRING, LAYOUTLMV3_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
     def batch_encode_plus(
         self,
         batch_text_or_text_pairs: Union[
@@ -445,7 +445,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
 
         return encodings[0].tokens if encodings else []
 
-    @add_end_docstrings(SUPERDOC_ENCODE_KWARGS_DOCSTRING, SUPERDOC_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
+    @add_end_docstrings(LAYOUTLMV3_ENCODE_KWARGS_DOCSTRING, LAYOUTLMV3_ENCODE_PLUS_ADDITIONAL_KWARGS_DOCSTRING)
     def encode_plus(
         self,
         text: Union[TextInput, PreTokenizedInput],
@@ -562,7 +562,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
         encodings = self._tokenizer.encode_batch(
             batch_text_or_text_pairs,
             add_special_tokens=add_special_tokens,
-            is_pretokenized=True,  # we set this to True as SuperDoc always expects pretokenized inputs
+            is_pretokenized=True,  # we set this to True as LayoutLMv3 always expects pretokenized inputs
         )
 
         # Convert encoding to dict
@@ -851,7 +851,7 @@ class SuperDocTokenizer(PreTrainedTokenizerFast):
         return cls + token_ids_0 + sep + sep + token_ids_1 + sep
 
 
-__all__ = ["SuperDocTokenizer", "SuperDocTokenizerFast"]
+__all__ = ["LayoutLMv3Tokenizer", "LayoutLMv3TokenizerFast"]
 
 # Backward alias
-SuperDocTokenizerFast = SuperDocTokenizer
+LayoutLMv3TokenizerFast = LayoutLMv3Tokenizer
