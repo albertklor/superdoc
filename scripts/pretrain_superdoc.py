@@ -154,7 +154,7 @@ class MixedDocumentDataset(TorchIterableDataset):
 
             # Normalize bboxes from pixel coordinates to 0-(max_2d_position_embeddings-1) range
             bbox_max = self.bbox_max
-            raw_bboxes = example["bboxes"]
+            raw_bboxes = example["bounding_boxes"]
             normalized_bboxes = []
             for bbox in raw_bboxes:
                 x0, y0, x1, y1 = bbox
@@ -168,7 +168,7 @@ class MixedDocumentDataset(TorchIterableDataset):
 
             processed = self.processor(
                 image,
-                example["tokens"],
+                example["words"],
                 boxes=normalized_bboxes,
                 truncation=True,
                 max_length=self.max_seq_length,
@@ -319,7 +319,7 @@ class SafeDocsEvalDataset(torch.utils.data.Dataset):
                 return None
 
             bbox_max = self.bbox_max
-            raw_bboxes = example["bboxes"]
+            raw_bboxes = example["bounding_boxes"]
             normalized_bboxes = []
             for bbox in raw_bboxes:
                 x0, y0, x1, y1 = bbox
@@ -332,7 +332,7 @@ class SafeDocsEvalDataset(torch.utils.data.Dataset):
 
             processed = self.processor(
                 image,
-                example["tokens"],
+                example["words"],
                 boxes=normalized_bboxes,
                 truncation=True,
                 max_length=self.max_seq_length,
