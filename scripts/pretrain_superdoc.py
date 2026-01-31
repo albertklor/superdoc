@@ -8,7 +8,10 @@ Supports mixed synthetic/real data training with configurable ratios.
 """
 
 import argparse
+import glob
+import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
@@ -19,7 +22,7 @@ import wandb
 from datasets import load_dataset
 from huggingface_hub import list_repo_files
 from torch.utils.data import IterableDataset as TorchIterableDataset
-from transformers import AutoProcessor, Trainer, TrainingArguments
+from transformers import AutoProcessor, Trainer, TrainingArguments, TrainerCallback
 
 from superdoc import LayoutLMv3Config, LayoutLMv3ForPreTraining
 from superdoc.muon import create_muon_optimizer
@@ -72,6 +75,7 @@ class MixedDocumentDataset(TorchIterableDataset):
         self.max_seq_length = max_seq_length
         self.seed = seed
         self.safedocs_percentage = safedocs_percentage
+        self.global_step_offset = 0  # For resumption: adjusts RNG seeding
 
         # Initialize document generator for synthetic data
         canvas_sizes = [
@@ -218,15 +222,20 @@ class MixedDocumentDataset(TorchIterableDataset):
         except Exception:
             return None
 
+    def set_global_step_offset(self, global_step: int):
+        """Set global step offset for RNG seeding when resuming."""
+        self.global_step_offset = global_step
+
     def __iter__(self) -> Iterator[dict]:
         """Iterate over mixed synthetic and real examples."""
         worker_info = torch.utils.data.get_worker_info()
 
-        # Adjust seed for worker
+        # Adjust seed for worker + global_step_offset for resumption
+        # This ensures different randomness after resuming vs starting fresh
         if worker_info is not None:
-            worker_seed = self.seed + worker_info.id
+            worker_seed = self.seed + worker_info.id + self.global_step_offset
         else:
-            worker_seed = self.seed
+            worker_seed = self.seed + self.global_step_offset
 
         rng = random.Random(worker_seed)
 
@@ -574,6 +583,25 @@ class LayoutLMv3PreTrainingCollator:
 
 
 # =============================================================================
+# Callbacks
+# =============================================================================
+
+class PushToHubCallback(TrainerCallback):
+    """Push model and processor to HuggingFace Hub after each evaluation."""
+
+    def __init__(self, hub_model_id: str, processor):
+        self.hub_model_id = hub_model_id
+        self.processor = processor
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if model is not None and self.hub_model_id:
+            print(f"\nPushing model to {self.hub_model_id}...")
+            model.push_to_hub(self.hub_model_id, commit_message=f"Step {state.global_step}")
+            self.processor.push_to_hub(self.hub_model_id, commit_message=f"Step {state.global_step}")
+            print(f"Pushed to https://huggingface.co/{self.hub_model_id}")
+
+
+# =============================================================================
 # Trainer
 # =============================================================================
 
@@ -687,6 +715,7 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=None)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--save_total_limit", type=int, default=3, help="Keep only last N checkpoints")
     parser.add_argument("--eval_steps", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -703,7 +732,19 @@ def parse_args():
     # Wandb
     parser.add_argument("--wandb_project", type=str, default="layoutlmv3-pretrain")
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_run_id", type=str, default=None, help="W&B run ID for resuming a run")
     parser.add_argument("--no_wandb", action="store_true")
+
+    # Hub
+    parser.add_argument("--push_to_hub", action="store_true", help="Push model to HuggingFace Hub after each eval")
+
+    # Resumption (for spot instances)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory or 'latest' to auto-detect latest checkpoint in output_dir",
+    )
 
     return parser.parse_args()
 
@@ -718,13 +759,21 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Initialize wandb
+    # Initialize wandb with resumption support
     if not args.no_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
-        )
+        wandb_kwargs = {
+            "project": args.wandb_project,
+            "name": args.wandb_run_name,
+            "config": vars(args),
+        }
+        if args.wandb_run_id:
+            # Resume existing run
+            wandb_kwargs["id"] = args.wandb_run_id
+            wandb_kwargs["resume"] = "must"  # Fail if run doesn't exist
+            print(f"Resuming W&B run: {args.wandb_run_id}")
+        wandb.init(**wandb_kwargs)
+        # Print run ID for future resumption
+        print(f"W&B run ID: {wandb.run.id} (use --wandb_run_id={wandb.run.id} to resume)")
 
     # Load config and processor
     config = LayoutLMv3Config.from_pretrained(args.hf_path)
@@ -793,6 +842,7 @@ def main():
         warmup_steps=args.warmup_steps if args.warmup_steps else 0,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
         save_strategy="steps",
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -819,6 +869,11 @@ def main():
             momentum=args.muon_momentum,
         )
 
+    # Create callbacks
+    callbacks = []
+    if args.push_to_hub:
+        callbacks.append(PushToHubCallback(hub_model_id=args.hf_path, processor=processor))
+
     # Create trainer
     trainer = LayoutLMv3PreTrainer(
         model=model,
@@ -830,7 +885,35 @@ def main():
         irr_weight=args.irr_weight,
         wpa_weight=args.wpa_weight,
         optimizers=(optimizer, None) if optimizer else (None, None),
+        callbacks=callbacks if callbacks else None,
     )
+
+    # Resolve checkpoint path
+    resume_checkpoint = None
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint.lower() == "latest":
+            # Auto-detect latest checkpoint in output_dir
+            checkpoint_dirs = glob.glob(os.path.join(args.output_dir, "checkpoint-*"))
+            if checkpoint_dirs:
+                # Sort by step number
+                checkpoint_dirs.sort(key=lambda x: int(x.split("-")[-1]))
+                resume_checkpoint = checkpoint_dirs[-1]
+                print(f"Auto-detected latest checkpoint: {resume_checkpoint}")
+            else:
+                print("No checkpoints found in output_dir, starting from scratch")
+        else:
+            resume_checkpoint = args.resume_from_checkpoint
+            print(f"Resuming from checkpoint: {resume_checkpoint}")
+
+    # Set global_step_offset for dataset RNG seeding when resuming
+    if resume_checkpoint:
+        trainer_state_path = os.path.join(resume_checkpoint, "trainer_state.json")
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path) as f:
+                trainer_state = json.load(f)
+            global_step = trainer_state.get("global_step", 0)
+            train_dataset.set_global_step_offset(global_step)
+            print(f"  Set dataset RNG offset to global_step={global_step}")
 
     # Train
     print("Starting training...")
@@ -839,8 +922,12 @@ def main():
     print(f"  - Eval every {args.eval_steps} steps ({len(eval_dataset)} samples)")
     if args.max_steps:
         print(f"  - Max steps: {args.max_steps}")
+    if args.push_to_hub:
+        print(f"  - Push to hub: {args.hf_path} (after each eval)")
+    if resume_checkpoint:
+        print(f"  - Resuming from: {resume_checkpoint}")
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     # Save final model
     print(f"Saving model to {args.output_dir}")
