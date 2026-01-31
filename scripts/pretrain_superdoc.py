@@ -8,6 +8,7 @@ Supports mixed synthetic/real data training with configurable ratios.
 """
 
 import argparse
+import math
 import random
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 import wandb
 from datasets import load_dataset
+from huggingface_hub import list_repo_files
 from torch.utils.data import IterableDataset as TorchIterableDataset
 from transformers import AutoProcessor, Trainer, TrainingArguments
 
@@ -46,6 +48,7 @@ class MixedDocumentDataset(TorchIterableDataset):
         synthetic_dataset_config: str = "sample-10BT",
         max_seq_length: int = 512,
         seed: int = 42,
+        safedocs_percentage: float = 100.0,
     ):
         """
         Args:
@@ -57,6 +60,7 @@ class MixedDocumentDataset(TorchIterableDataset):
             synthetic_dataset_config: Config/subset name for synthetic dataset
             max_seq_length: Maximum sequence length for tokenization
             seed: Random seed
+            safedocs_percentage: Percentage of SafeDocs dataset to download (1-100)
         """
         self.processor = processor
         self.max_2d_position_embeddings = max_2d_position_embeddings
@@ -67,6 +71,7 @@ class MixedDocumentDataset(TorchIterableDataset):
         self.synthetic_dataset_config = synthetic_dataset_config
         self.max_seq_length = max_seq_length
         self.seed = seed
+        self.safedocs_percentage = safedocs_percentage
 
         # Initialize document generator for synthetic data
         canvas_sizes = [
@@ -96,12 +101,26 @@ class MixedDocumentDataset(TorchIterableDataset):
         # Arrow format uses mmap, so workers share physical memory pages.
         # The dataset object is pickle-friendly - workers re-open the same mmap.
         if self.synthetic_ratio < 1.0:
-            print(f"Loading real dataset {real_dataset_name} (memory-mapped)...")
-            self._real_dataset = load_dataset(
-                real_dataset_name,
-                split="train",
-                keep_in_memory=False,  # Use memory-mapping, not RAM
-            )
+            if self.safedocs_percentage < 100.0:
+                # List parquet files and download only a subset
+                all_files = list_repo_files(real_dataset_name, repo_type="dataset")
+                train_files = sorted([f for f in all_files if f.startswith("data/train/") and f.endswith(".parquet")])
+                num_files = max(1, math.ceil(len(train_files) * self.safedocs_percentage / 100.0))
+                selected_files = train_files[:num_files]
+                print(f"Loading real dataset {real_dataset_name} ({self.safedocs_percentage:.1f}%, {num_files}/{len(train_files)} files)...")
+                self._real_dataset = load_dataset(
+                    real_dataset_name,
+                    data_files={"train": selected_files},
+                    split="train",
+                    keep_in_memory=False,
+                )
+            else:
+                print(f"Loading real dataset {real_dataset_name} (memory-mapped)...")
+                self._real_dataset = load_dataset(
+                    real_dataset_name,
+                    split="train",
+                    keep_in_memory=False,  # Use memory-mapping, not RAM
+                )
             self._real_dataset_len = len(self._real_dataset)
             print(f"  Loaded {self._real_dataset_len} examples (shared via mmap)")
         else:
@@ -257,17 +276,32 @@ class SafeDocsEvalDataset(torch.utils.data.Dataset):
         max_2d_position_embeddings: int = 1024,
         dataset_name: str = "albertklorer/safedocs",
         max_seq_length: int = 512,
+        safedocs_percentage: float = 100.0,
     ):
         self.processor = processor
         self.bbox_max = max_2d_position_embeddings - 1
         self.max_seq_length = max_seq_length
 
-        print(f"Loading evaluation dataset {dataset_name} (validation split)...")
-        self._dataset = load_dataset(
-            dataset_name,
-            split="validation",
-            keep_in_memory=False,
-        )
+        if safedocs_percentage < 100.0:
+            # List parquet files and download only a subset
+            all_files = list_repo_files(dataset_name, repo_type="dataset")
+            val_files = sorted([f for f in all_files if f.startswith("data/validation/") and f.endswith(".parquet")])
+            num_files = max(1, math.ceil(len(val_files) * safedocs_percentage / 100.0))
+            selected_files = val_files[:num_files]
+            print(f"Loading evaluation dataset {dataset_name} ({safedocs_percentage:.1f}%, {num_files}/{len(val_files)} files)...")
+            self._dataset = load_dataset(
+                dataset_name,
+                data_files={"validation": selected_files},
+                split="validation",
+                keep_in_memory=False,
+            )
+        else:
+            print(f"Loading evaluation dataset {dataset_name} (validation split)...")
+            self._dataset = load_dataset(
+                dataset_name,
+                split="validation",
+                keep_in_memory=False,
+            )
         print(f"  Loaded {len(self._dataset)} eval examples")
 
     def __len__(self):
@@ -588,7 +622,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Pretrain LayoutLMv3 model")
 
     # Model arguments
-    parser.add_argument("--hf_path", type=str, default="albertklorer/layoutlmv3-base")
+    parser.add_argument("--hf_path", type=str, default="microsoft/layoutlmv3-base")
     parser.add_argument("--from_scratch", action="store_true")
 
     # Data source arguments
@@ -623,6 +657,12 @@ def parse_args():
         help="Maximum sequence length for tokenization",
     )
     parser.add_argument(
+        "--safedocs_percentage",
+        type=float,
+        default=100.0,
+        help="Percentage of SafeDocs dataset to download (1-100). Useful for testing with smaller data.",
+    )
+    parser.add_argument(
         "--max_steps",
         type=int,
         default=None,
@@ -643,7 +683,7 @@ def parse_args():
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--warmup_steps", type=int, default=None)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=1000)
@@ -706,6 +746,8 @@ def main():
     # Create mixed dataset
     print(f"Creating mixed dataset (synthetic_ratio={args.synthetic_ratio})...")
     print(f"  - Real data: {args.real_dataset}")
+    if args.safedocs_percentage < 100.0:
+        print(f"  - SafeDocs percentage: {args.safedocs_percentage:.1f}%")
     print(f"  - Synthetic text: {args.synthetic_dataset}/{args.synthetic_dataset_config}")
     print(f"  - Max sequence length: {args.max_seq_length}")
 
@@ -718,14 +760,16 @@ def main():
         synthetic_dataset_config=args.synthetic_dataset_config,
         max_seq_length=args.max_seq_length,
         seed=args.seed,
+        safedocs_percentage=args.safedocs_percentage,
     )
 
-    # Create eval dataset from SafeDocs validation split (full set)
+    # Create eval dataset from SafeDocs validation split
     eval_dataset = SafeDocsEvalDataset(
         processor=processor,
         max_2d_position_embeddings=config.max_2d_position_embeddings,
         dataset_name=args.real_dataset,
         max_seq_length=args.max_seq_length,
+        safedocs_percentage=args.safedocs_percentage,
     )
 
     # Create data collator
