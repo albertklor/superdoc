@@ -291,26 +291,18 @@ class SafeDocsEvalDataset(torch.utils.data.Dataset):
         self.bbox_max = max_2d_position_embeddings - 1
         self.max_seq_length = max_seq_length
 
-        if safedocs_percentage < 100.0:
-            # List parquet files and download only a subset
-            all_files = list_repo_files(dataset_name, repo_type="dataset")
-            val_files = sorted([f for f in all_files if f.startswith("data/validation/") and f.endswith(".parquet")])
-            num_files = max(1, math.ceil(len(val_files) * safedocs_percentage / 100.0))
-            selected_files = val_files[:num_files]
-            print(f"Loading evaluation dataset {dataset_name} ({safedocs_percentage:.1f}%, {num_files}/{len(val_files)} files)...")
-            self._dataset = load_dataset(
-                dataset_name,
-                data_files={"validation": selected_files},
-                split="validation",
-                keep_in_memory=False,
-            )
-        else:
-            print(f"Loading evaluation dataset {dataset_name} (validation split)...")
-            self._dataset = load_dataset(
-                dataset_name,
-                split="validation",
-                keep_in_memory=False,
-            )
+        # Always use data_files to avoid downloading entire dataset (including train split)
+        all_files = list_repo_files(dataset_name, repo_type="dataset")
+        val_files = sorted([f for f in all_files if f.startswith("data/validation/") and f.endswith(".parquet")])
+        num_files = max(1, math.ceil(len(val_files) * safedocs_percentage / 100.0))
+        selected_files = val_files[:num_files]
+        print(f"Loading evaluation dataset {dataset_name} ({safedocs_percentage:.1f}%, {num_files}/{len(val_files)} files)...")
+        self._dataset = load_dataset(
+            dataset_name,
+            data_files={"validation": selected_files},
+            split="validation",
+            keep_in_memory=False,
+        )
         print(f"  Loaded {len(self._dataset)} eval examples")
 
     def __len__(self):
@@ -383,7 +375,8 @@ class LayoutLMv3PreTrainingCollator:
         if self.mask_token_id is None:
             self.mask_token_id = self.processor.tokenizer.mask_token_id
         if self.vocab_size is None:
-            self.vocab_size = self.processor.tokenizer.vocab_size
+            # Use len() not .vocab_size - they differ due to added_tokens
+            self.vocab_size = len(self.processor.tokenizer)
         if self.pad_token_id is None:
             self.pad_token_id = self.processor.tokenizer.pad_token_id
 
@@ -759,8 +752,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Initialize wandb with resumption support
-    if not args.no_wandb:
+    # Check if we're the main process (for distributed training)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main_process = local_rank == 0
+
+    # Initialize wandb with resumption support (only on main process)
+    if not args.no_wandb and is_main_process:
         wandb_kwargs = {
             "project": args.wandb_project,
             "name": args.wandb_run_name,
@@ -791,6 +788,12 @@ def main():
     else:
         print(f"Loading pretrained model from {args.hf_path}...")
         model = LayoutLMv3ForPreTraining.from_pretrained(args.hf_path, config=config)
+
+    # Resize embeddings if tokenizer vocab differs from model vocab
+    tokenizer_vocab_size = len(processor.tokenizer)
+    if model.config.vocab_size != tokenizer_vocab_size:
+        print(f"Resizing model embeddings: {model.config.vocab_size} -> {tokenizer_vocab_size}")
+        model.resize_token_embeddings(tokenizer_vocab_size)
 
     # Create mixed dataset
     print(f"Creating mixed dataset (synthetic_ratio={args.synthetic_ratio})...")
@@ -934,7 +937,7 @@ def main():
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 
-    if not args.no_wandb:
+    if not args.no_wandb and is_main_process:
         wandb.finish()
 
 
