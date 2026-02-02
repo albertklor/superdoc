@@ -83,10 +83,12 @@ class LayoutLMv3TextEmbeddings(nn.Module):
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
         )
 
-        self.padding_idx = config.pad_token_id
-        self.position_embeddings = nn.Embedding(
-            config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
-        )
+        # Note: We don't use padding_idx for position_embeddings because:
+        # 1. Position IDs are not the same as token IDs
+        # 2. The attention mask already handles ignoring padded positions
+        # 3. Using pad_token_id as padding_idx only works when pad_token_id < max_position_embeddings
+        self.padding_idx = config.pad_token_id  # Kept for compatibility but not used for position_embeddings
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
 
         self.x_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
         self.y_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
@@ -1077,14 +1079,14 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
             nn.Linear(config.hidden_size, config.vocab_size),
         )
 
-        # IRR Head: [batch, hidden_size] (CLS token) -> [batch, num_patches]
-        # num_patches = (input_size / patch_size)^2 = (224/16)^2 = 196
-        num_patches = (config.input_size // config.patch_size) ** 2
+        # IRR Head: [batch, hidden_size] -> [batch, 16]
+        # Visual CLS token predicts which of 16 regions (4x4 grid) were replaced
+        self.irr_grid_size = 4  # 4x4 = 16 regions
         self.irr_head = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
             nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
-            nn.Linear(config.hidden_size, num_patches),
+            nn.Linear(config.hidden_size, self.irr_grid_size ** 2),
         )
 
         # WPA Head: [batch, seq_len, hidden_size] -> [batch, seq_len]
@@ -1172,7 +1174,7 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
 
         # Compute logits for each head
         mlm_logits = self.mlm_head(text_output)  # [batch, seq_len, vocab_size]
-        irr_logits = self.irr_head(visual_cls)   # [batch, num_patches]
+        irr_logits = self.irr_head(visual_cls)   # [batch, 16] (4x4 grid)
         wpa_logits = self.wpa_head(text_output).squeeze(-1)  # [batch, seq_len]
 
         # Compute losses
