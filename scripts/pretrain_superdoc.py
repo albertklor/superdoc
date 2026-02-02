@@ -367,8 +367,8 @@ class LayoutLMv3PreTrainingCollator:
     mask_token_id: int = None
     vocab_size: int = None
     pad_token_id: int = None
-    num_patches: int = 196
-    patch_grid_size: int = 14
+    irr_grid_size: int = 4  # 4x4 = 16 regions for IRR
+    num_irr_regions: int = 16
     max_2d_position_embeddings: int = 1024
 
     def __post_init__(self):
@@ -396,7 +396,7 @@ class LayoutLMv3PreTrainingCollator:
         original_pixel_values = pixel_values.clone()
 
         mlm_labels = torch.full_like(input_ids, -100)
-        irr_labels = torch.zeros(batch_size, self.num_patches)
+        irr_labels = torch.zeros(batch_size, self.num_irr_regions)
         wpa_labels = torch.full_like(input_ids, -100, dtype=torch.float)
 
         for i in range(batch_size):
@@ -406,7 +406,7 @@ class LayoutLMv3PreTrainingCollator:
                 attention_mask[i],
             )
 
-            pixel_values[i], irr_labels[i], replaced_patches = self._apply_irr(
+            pixel_values[i], irr_labels[i], replaced_regions = self._apply_irr(
                 pixel_values[i],
                 original_pixel_values,
                 i,
@@ -415,7 +415,7 @@ class LayoutLMv3PreTrainingCollator:
             wpa_labels[i] = self._compute_wpa_labels(
                 bbox[i],
                 attention_mask[i],
-                replaced_patches,
+                replaced_regions,
             )
 
         return {
@@ -497,80 +497,88 @@ class LayoutLMv3PreTrainingCollator:
         all_pixel_values: torch.Tensor,
         current_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor, set]:
-        irr_labels = torch.zeros(self.num_patches)
-        replaced_patches = set()
+        """Apply IRR using 4x4 grid (16 regions of 56x56 pixels each)."""
+        irr_labels = torch.zeros(self.num_irr_regions)
+        replaced_regions = set()
 
-        num_patches_to_replace = max(1, int(self.num_patches * self.irr_probability))
-        patches_to_replace = random.sample(range(self.num_patches), num_patches_to_replace)
+        num_regions_to_replace = max(1, int(self.num_irr_regions * self.irr_probability))
+        regions_to_replace = random.sample(range(self.num_irr_regions), num_regions_to_replace)
 
         batch_size = all_pixel_values.size(0)
-        patch_size = 16
+        image_size = pixel_values.shape[-1]  # 224
+        region_size = image_size // self.irr_grid_size  # 56 pixels per region
 
-        for patch_idx in patches_to_replace:
-            row = patch_idx // self.patch_grid_size
-            col = patch_idx % self.patch_grid_size
+        for region_idx in regions_to_replace:
+            row = region_idx // self.irr_grid_size
+            col = region_idx % self.irr_grid_size
 
-            y_start = row * patch_size
-            y_end = y_start + patch_size
-            x_start = col * patch_size
-            x_end = x_start + patch_size
+            y_start = row * region_size
+            y_end = y_start + region_size
+            x_start = col * region_size
+            x_end = x_start + region_size
 
             if batch_size > 1:
                 source_idx = random.choice([j for j in range(batch_size) if j != current_idx])
             else:
                 source_idx = current_idx
 
-            source_patch_idx = random.randint(0, self.num_patches - 1)
-            source_row = source_patch_idx // self.patch_grid_size
-            source_col = source_patch_idx % self.patch_grid_size
-            source_y_start = source_row * patch_size
-            source_y_end = source_y_start + patch_size
-            source_x_start = source_col * patch_size
-            source_x_end = source_x_start + patch_size
+            source_region_idx = random.randint(0, self.num_irr_regions - 1)
+            source_row = source_region_idx // self.irr_grid_size
+            source_col = source_region_idx % self.irr_grid_size
+            source_y_start = source_row * region_size
+            source_y_end = source_y_start + region_size
+            source_x_start = source_col * region_size
+            source_x_end = source_x_start + region_size
 
             pixel_values[:, y_start:y_end, x_start:x_end] = \
                 all_pixel_values[source_idx, :, source_y_start:source_y_end, source_x_start:source_x_end].clone()
 
-            irr_labels[patch_idx] = 1.0
-            replaced_patches.add(patch_idx)
+            irr_labels[region_idx] = 1.0
+            replaced_regions.add(region_idx)
 
-        return pixel_values, irr_labels, replaced_patches
+        return pixel_values, irr_labels, replaced_regions
 
     def _compute_wpa_labels(
         self,
         bbox: torch.Tensor,
         attention_mask: torch.Tensor,
-        replaced_patches: set,
+        replaced_regions: set,
     ) -> torch.Tensor:
+        """Compute WPA labels: 1 if word bbox intersects any replaced region. Vectorized."""
         seq_len = bbox.size(0)
+        bbox_max = self.max_2d_position_embeddings - 1
+        region_size = 224.0 / self.irr_grid_size
+        grid = self.irr_grid_size
+
+        # Build replaced regions mask [4, 4]
+        replaced_mask = torch.zeros(grid, grid, dtype=torch.bool)
+        for r in replaced_regions:
+            replaced_mask[r // grid, r % grid] = True
+
+        # Map bbox to pixel coords [seq_len, 4]
+        pixel_bbox = bbox.float() * (223.0 / bbox_max)
+
+        # Get region indices for each corner
+        col_start = (pixel_bbox[:, 0] / region_size).long().clamp(0, grid - 1)
+        row_start = (pixel_bbox[:, 1] / region_size).long().clamp(0, grid - 1)
+        col_end = (pixel_bbox[:, 2] / region_size).long().clamp(0, grid - 1)
+        row_end = (pixel_bbox[:, 3] / region_size).long().clamp(0, grid - 1)
+
+        # Valid tokens: attended and non-zero bbox
+        valid = (attention_mask == 1) & (bbox.sum(dim=1) > 0)
+
+        # Check intersection with replaced regions
         wpa_labels = torch.full((seq_len,), -100, dtype=torch.float)
-        bbox_max = self.max_2d_position_embeddings - 1  # 1023 for 1024
 
-        for idx in range(seq_len):
-            if attention_mask[idx] == 0:
-                continue
-
-            box = bbox[idx].tolist()
-
-            if box == [0, 0, 0, 0]:
-                continue
-
-            center_x = (box[0] + box[2]) / 2
-            center_y = (box[1] + box[3]) / 2
-
-            # Map normalized coords [0, bbox_max] to pixel coords [0, 223]
-            pixel_x = center_x * 223 / bbox_max
-            pixel_y = center_y * 223 / bbox_max
-
-            patch_col = int(pixel_x / 16)
-            patch_row = int(pixel_y / 16)
-
-            patch_col = min(patch_col, self.patch_grid_size - 1)
-            patch_row = min(patch_row, self.patch_grid_size - 1)
-
-            patch_idx = patch_row * self.patch_grid_size + patch_col
-
-            wpa_labels[idx] = 1.0 if patch_idx in replaced_patches else 0.0
+        # For each valid token, check if any covered region is replaced
+        valid_indices = valid.nonzero(as_tuple=True)[0]
+        for idx in valid_indices:
+            i = idx.item()
+            # Check all regions in the bbox range
+            if replaced_mask[row_start[i]:row_end[i]+1, col_start[i]:col_end[i]+1].any():
+                wpa_labels[i] = 1.0
+            else:
+                wpa_labels[i] = 0.0
 
         return wpa_labels
 
@@ -789,11 +797,12 @@ def main():
         print(f"Loading pretrained model from {args.hf_path}...")
         model = LayoutLMv3ForPreTraining.from_pretrained(args.hf_path, config=config)
 
-    # Resize embeddings if tokenizer vocab differs from model vocab
+    # Verify vocab sizes match
     tokenizer_vocab_size = len(processor.tokenizer)
-    if model.config.vocab_size != tokenizer_vocab_size:
-        print(f"Resizing model embeddings: {model.config.vocab_size} -> {tokenizer_vocab_size}")
-        model.resize_token_embeddings(tokenizer_vocab_size)
+    assert model.config.vocab_size == tokenizer_vocab_size, (
+        f"Vocab size mismatch: model={model.config.vocab_size}, tokenizer={tokenizer_vocab_size}. "
+        f"Regenerate your model with the correct vocab size."
+    )
 
     # Create mixed dataset
     print(f"Creating mixed dataset (synthetic_ratio={args.synthetic_ratio})...")
@@ -857,6 +866,7 @@ def main():
         remove_unused_columns=False,
         dataloader_num_workers=args.dataloader_num_workers,
         load_best_model_at_end=False,
+        ignore_data_skip=True,  # Don't skip examples on resume - we use RNG offset instead
     )
 
     # Create optimizer
