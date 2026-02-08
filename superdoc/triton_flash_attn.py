@@ -191,8 +191,10 @@ def _bwd_kernel(
         delta = tl.load(delta_ptrs, mask=offs_m_curr < seqlen_q, other=0.0)
 
         # Recompute attention scores: QK^T * scale
+        # Cast q * softmax_scale back to q.dtype to avoid fp32/fp16 mismatch in tl.dot
+        q_scaled = (q * softmax_scale).to(q.dtype)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk = tl.dot(q * softmax_scale, tl.trans(k), qk)
+        qk = tl.dot(q_scaled, tl.trans(k), qk)
 
         # Add bias if present
         if HAVE_BIAS:
@@ -309,8 +311,6 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
 
         ctx.save_for_backward(q, k, v, bias, out, lse)
         ctx.softmax_scale = softmax_scale
-        ctx.BLOCK_M = BLOCK_M
-        ctx.BLOCK_N = BLOCK_N
         ctx.BLOCK_HEADDIM = BLOCK_HEADDIM
 
         return out
@@ -320,9 +320,12 @@ class FlashAttnWithBiasFunc(torch.autograd.Function):
         """Backward pass."""
         q, k, v, bias, out, lse = ctx.saved_tensors
         softmax_scale = ctx.softmax_scale
-        BLOCK_M = ctx.BLOCK_M
-        BLOCK_N = ctx.BLOCK_N
         BLOCK_HEADDIM = ctx.BLOCK_HEADDIM
+
+        # Use smaller block sizes for backward to fit in shared memory
+        # Backward needs to hold Q, K, V, dO plus intermediates
+        BLOCK_M = 32
+        BLOCK_N = 32
 
         batch, nheads, seqlen_q, headdim = q.shape
         _, _, seqlen_k, _ = k.shape

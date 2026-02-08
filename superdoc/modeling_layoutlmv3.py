@@ -439,12 +439,8 @@ class LayoutLMv3Encoder(nn.Module):
             num_buckets=self.rel_pos_bins,
             max_distance=self.max_rel_pos,
         )
-        # Since this is a simple indexing operation that is independent of the input,
-        # no need to track gradients for this operation
-        #
-        # Without this no_grad context, training speed slows down significantly
-        with torch.no_grad():
-            rel_pos = self.rel_pos_bias.weight.t()[rel_pos].permute(0, 3, 1, 2)
+        # Keep gradients enabled so relative bias projections can train from scratch.
+        rel_pos = self.rel_pos_bias.weight.t()[rel_pos].permute(0, 3, 1, 2)
         rel_pos = rel_pos.contiguous()
         return rel_pos
 
@@ -463,13 +459,9 @@ class LayoutLMv3Encoder(nn.Module):
             num_buckets=self.rel_2d_pos_bins,
             max_distance=self.max_rel_2d_pos,
         )
-        # Since this is a simple indexing operation that is independent of the input,
-        # no need to track gradients for this operation
-        #
-        # Without this no_grad context, training speed slows down significantly
-        with torch.no_grad():
-            rel_pos_x = self.rel_pos_x_bias.weight.t()[rel_pos_x].permute(0, 3, 1, 2)
-            rel_pos_y = self.rel_pos_y_bias.weight.t()[rel_pos_y].permute(0, 3, 1, 2)
+        # Keep gradients enabled so spatial bias projections can train from scratch.
+        rel_pos_x = self.rel_pos_x_bias.weight.t()[rel_pos_x].permute(0, 3, 1, 2)
+        rel_pos_y = self.rel_pos_y_bias.weight.t()[rel_pos_y].permute(0, 3, 1, 2)
         rel_pos_x = rel_pos_x.contiguous()
         rel_pos_y = rel_pos_y.contiguous()
         rel_2d_pos = rel_pos_x + rel_pos_y
@@ -731,7 +723,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
                 final_bbox = bbox
             if self.config.has_relative_attention_bias:
                 position_ids = self.embeddings.position_ids[:, : input_shape[1]]
-                position_ids = position_ids.expand_as(input_ids)
+                position_ids = position_ids.expand(batch_size, input_shape[1])
                 final_position_ids = position_ids
 
         extended_attention_mask = self._get_extended_attention_mask(
@@ -1035,15 +1027,19 @@ class LayoutLMv3PreTrainingOutput(ModelOutput):
 
     Args:
         loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
-            Total pretraining loss (weighted sum of MLM, IRR, and WPA losses).
+            Total pretraining loss (weighted sum of MLM, ROP, IRR, and WPA losses).
         mlm_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
             Masked language modeling loss.
+        rop_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Reading-order prediction loss.
         irr_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
             Image region replacement loss.
         wpa_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
             Word patch alignment loss.
         mlm_logits (`torch.FloatTensor` of shape `(batch_size, seq_len, vocab_size)`):
             Prediction scores of the MLM head.
+        rop_logits (`torch.FloatTensor` of shape `(batch_size, seq_len, rop_vocab_size)`):
+            Prediction scores of the reading-order head.
         irr_logits (`torch.FloatTensor` of shape `(batch_size, num_patches)`):
             Prediction scores of the IRR head (binary per patch).
         wpa_logits (`torch.FloatTensor` of shape `(batch_size, seq_len)`):
@@ -1052,9 +1048,11 @@ class LayoutLMv3PreTrainingOutput(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     mlm_loss: Optional[torch.FloatTensor] = None
+    rop_loss: Optional[torch.FloatTensor] = None
     irr_loss: Optional[torch.FloatTensor] = None
     wpa_loss: Optional[torch.FloatTensor] = None
     mlm_logits: torch.FloatTensor = None
+    rop_logits: torch.FloatTensor = None
     irr_logits: torch.FloatTensor = None
     wpa_logits: torch.FloatTensor = None
 
@@ -1063,6 +1061,7 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
     """
     LayoutLMv3 model with pretraining heads for:
     - MLM: Masked Language Modeling (whole word masking)
+    - ROP: Reading Order Prediction (first subword predicts reading-order index)
     - IRR: Image Region Replacement (predict which patches were replaced)
     - WPA: Word Patch Alignment (predict if word center overlaps replaced patch)
     """
@@ -1077,6 +1076,19 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
             nn.GELU(),
             nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
             nn.Linear(config.hidden_size, config.vocab_size),
+        )
+
+        # ROP Head: MLM-style classifier over reading-order classes.
+        # Default class count follows max sequence length (max_position_embeddings - 2).
+        self.rop_vocab_size = int(
+            getattr(config, "rop_vocab_size", max(1, config.max_position_embeddings - 2))
+        )
+        self.config.rop_vocab_size = self.rop_vocab_size
+        self.rop_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, self.rop_vocab_size),
         )
 
         # IRR Head: [batch, hidden_size] -> [batch, 16]
@@ -1118,9 +1130,11 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.FloatTensor | None = None,
         mlm_labels: torch.LongTensor | None = None,
+        rop_labels: torch.LongTensor | None = None,
         irr_labels: torch.FloatTensor | None = None,
         wpa_labels: torch.FloatTensor | None = None,
         mlm_weight: float = 1.0,
+        rop_weight: float = 1.0,
         irr_weight: float = 1.0,
         wpa_weight: float = 1.0,
         output_attentions: bool | None = None,
@@ -1132,19 +1146,28 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
         Args:
             mlm_labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
                 Labels for MLM. Positions with -100 are ignored. Other values are token ids.
+            rop_labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Labels for reading-order prediction. Only first subwords are labeled; others are -100.
             irr_labels (`torch.FloatTensor` of shape `(batch_size, num_patches)`, *optional*):
                 Labels for IRR. 1 for replaced patches, 0 for original.
             wpa_labels (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
-                Labels for WPA. 1 if token's bbox center is in a replaced patch, 0 otherwise.
-                Positions with -100 are ignored.
+                Labels for WPA. 1 if word's bbox region was replaced with noise, 0 otherwise.
+                Positions with -100 are ignored (CLS, SEP, padding).
             mlm_weight (`float`, *optional*, defaults to 1.0):
                 Weight for MLM loss.
+            rop_weight (`float`, *optional*, defaults to 1.0):
+                Weight for ROP loss.
             irr_weight (`float`, *optional*, defaults to 1.0):
                 Weight for IRR loss.
             wpa_weight (`float`, *optional*, defaults to 1.0):
                 Weight for WPA loss.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if pixel_values is None:
+            raise ValueError("LayoutLMv3ForPreTraining requires `pixel_values` (image embeddings).")
+        if not self.layoutlmv3.config.visual_embed:
+            raise ValueError("LayoutLMv3ForPreTraining requires `config.visual_embed=True`.")
 
         outputs = self.layoutlmv3(
             input_ids,
@@ -1165,6 +1188,10 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
             seq_length = input_ids.size(1)
         else:
             seq_length = inputs_embeds.size(1)
+        if sequence_output.size(1) <= seq_length:
+            raise ValueError(
+                "LayoutLMv3ForPreTraining expected visual tokens in the encoder output."
+            )
 
         # Text portion: [batch, seq_len, hidden_size]
         text_output = sequence_output[:, :seq_length, :]
@@ -1174,18 +1201,25 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
 
         # Compute logits for each head
         mlm_logits = self.mlm_head(text_output)  # [batch, seq_len, vocab_size]
+        rop_logits = self.rop_head(text_output)  # [batch, seq_len, rop_vocab_size]
         irr_logits = self.irr_head(visual_cls)   # [batch, 16] (4x4 grid)
         wpa_logits = self.wpa_head(text_output).squeeze(-1)  # [batch, seq_len]
 
         # Compute losses
         total_loss = None
         mlm_loss = None
+        rop_loss = None
         irr_loss = None
         wpa_loss = None
 
         if mlm_labels is not None:
             loss_fct = CrossEntropyLoss(ignore_index=-100)
             mlm_loss = loss_fct(mlm_logits.view(-1, self.config.vocab_size), mlm_labels.view(-1))
+
+        if rop_labels is not None:
+            if (rop_labels != -100).any():
+                loss_fct = CrossEntropyLoss(ignore_index=-100)
+                rop_loss = loss_fct(rop_logits.view(-1, self.rop_vocab_size), rop_labels.view(-1))
 
         if irr_labels is not None:
             loss_fct = BCEWithLogitsLoss()
@@ -1205,6 +1239,8 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
         losses = []
         if mlm_loss is not None:
             losses.append(mlm_weight * mlm_loss)
+        if rop_loss is not None:
+            losses.append(rop_weight * rop_loss)
         if irr_loss is not None:
             losses.append(irr_weight * irr_loss)
         if wpa_loss is not None:
@@ -1212,15 +1248,17 @@ class LayoutLMv3ForPreTraining(LayoutLMv3PreTrainedModel):
         total_loss = sum(losses) if losses else None
 
         if not return_dict:
-            output = (mlm_logits, irr_logits, wpa_logits) + outputs[1:]
-            return ((total_loss, mlm_loss, irr_loss, wpa_loss) + output) if total_loss is not None else output
+            output = (mlm_logits, rop_logits, irr_logits, wpa_logits) + outputs[1:]
+            return ((total_loss, mlm_loss, rop_loss, irr_loss, wpa_loss) + output) if total_loss is not None else output
 
         return LayoutLMv3PreTrainingOutput(
             loss=total_loss,
             mlm_loss=mlm_loss,
+            rop_loss=rop_loss,
             irr_loss=irr_loss,
             wpa_loss=wpa_loss,
             mlm_logits=mlm_logits,
+            rop_logits=rop_logits,
             irr_logits=irr_logits,
             wpa_logits=wpa_logits,
         )

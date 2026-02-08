@@ -10,7 +10,7 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3PreTrainedModel,
     LayoutLMv3PreTrainingOutput,
 )
-from .processing_layoutlmv3 import LayoutLMv3Processor
+from transformers import LayoutLMv3Processor
 from .tokenization_layoutlmv3 import LayoutLMv3Tokenizer
 from .image_processing_layoutlmv3 import LayoutLMv3ImageProcessor
 from .muon import Muon, MuonAdamW, create_muon_optimizer

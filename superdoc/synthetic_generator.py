@@ -8,6 +8,7 @@ Features structural diversity: columns, paragraphs, headers, lists, indentation.
 """
 
 import os
+import math
 import random
 import re
 from typing import Dict, List, Optional, Tuple, Union
@@ -70,15 +71,17 @@ class DocumentGenerator:
         font_paths: Union[str, List[str], None] = None,
         font_sizes: Union[int, List[int], Tuple[int, int]] = 12,
         canvas_sizes: Union[Tuple[int, int], List[Tuple[int, int]]] = None,
+        canvas_area_weight_power: float = 0.0,
         margin_ratio: float = 0.045,
         line_spacing: float = 1.2,
+        font_scale_power: float = 1.0,
         rgb: bool = True,
         background_color: Union[int, Tuple[int, int], List[int]] = 255,
         text_color: Union[int, Tuple[int, int], List[int]] = 0,
         horizontal_shift: Union[float, Tuple[float, float]] = 0.0,
         # Structural diversity options
         num_columns: Union[int, List[int]] = [1, 1, 1, 2, 2, 3],
-        paragraph_spacing: Union[float, Tuple[float, float]] = (0.5, 2.0),
+        paragraph_spacing: Union[float, Tuple[float, float]] = (1.0, 1.8),
         indent_ratio: Union[float, Tuple[float, float]] = (0.0, 0.15),
         title_prob: float = 0.3,
         title_size_multiplier: Tuple[float, float] = (1.3, 1.8),
@@ -89,14 +92,22 @@ class DocumentGenerator:
         self.output_size = output_size
         self.margin_ratio = margin_ratio
         self.line_spacing = line_spacing
+        self._font_scale_power = max(0.0, float(font_scale_power))
+        self._canvas_area_weight_power = max(0.0, float(canvas_area_weight_power))
         self.rgb = rgb
         self._mode = "RGB" if rgb else "L"
         self._bbox_max = bbox_max
+        self._col_gap_ratio = 0.03
+        # Keep output columns readable after any canvas downscaling.
+        self._min_output_column_width = 72
 
         # Structural options
         self._num_columns_options = [num_columns] if isinstance(num_columns, int) else list(num_columns)
-        self._para_spacing_range = (paragraph_spacing, paragraph_spacing) if isinstance(paragraph_spacing, (int, float)) else paragraph_spacing
-        self._indent_range = (indent_ratio, indent_ratio) if isinstance(indent_ratio, (int, float)) else indent_ratio
+        self._num_columns_options = [max(1, int(c)) for c in self._num_columns_options]
+        para_spacing = (paragraph_spacing, paragraph_spacing) if isinstance(paragraph_spacing, (int, float)) else paragraph_spacing
+        indent_ratio = (indent_ratio, indent_ratio) if isinstance(indent_ratio, (int, float)) else indent_ratio
+        self._para_spacing_range = self._normalize_range(para_spacing, min_value=1.0)
+        self._indent_range = self._normalize_range(indent_ratio, min_value=0.0, max_value=0.4)
         self._title_prob = title_prob
         self._title_size_mult_range = title_size_multiplier
         self._list_prob = list_prob
@@ -133,6 +144,18 @@ class DocumentGenerator:
         else:
             self._canvas_sizes = list(canvas_sizes)
             self._needs_resize = True
+        if not self._canvas_sizes:
+            raise ValueError("canvas_sizes must contain at least one entry.")
+
+        output_area = float(self.output_size[0] * self.output_size[1])
+        self._canvas_sample_weights: List[float] = []
+        for canvas_w, canvas_h in self._canvas_sizes:
+            relative_area = max(1.0, float(canvas_w * canvas_h) / output_area)
+            weight = relative_area ** self._canvas_area_weight_power
+            self._canvas_sample_weights.append(weight)
+
+        resampling = getattr(Image, "Resampling", Image)
+        self._resize_resample = resampling.BILINEAR
 
         # Parse colors
         self._bg_color_config = self._parse_color_config(background_color)
@@ -197,6 +220,23 @@ class DocumentGenerator:
             return {"type": "list", "values": color}
         return {"type": "fixed", "value": 128}
 
+    def _normalize_range(
+        self,
+        value: Tuple[float, float],
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        lo, hi = float(value[0]), float(value[1])
+        if lo > hi:
+            lo, hi = hi, lo
+        if min_value is not None:
+            lo = max(lo, min_value)
+            hi = max(hi, min_value)
+        if max_value is not None:
+            lo = min(lo, max_value)
+            hi = min(hi, max_value)
+        return lo, hi
+
     def _sample_color(self, config: dict) -> int:
         if config["type"] == "fixed":
             return config["value"]
@@ -220,7 +260,7 @@ class DocumentGenerator:
             return cache[word]
 
         font = self._get_font(font_path, size)
-        width = int(font.getlength(word))
+        width = int(math.ceil(font.getlength(word)))
 
         if len(cache) < 10000:
             if key not in self._word_width_caches:
@@ -232,7 +272,40 @@ class DocumentGenerator:
     def _get_font_height(self, font_path: str, size: int) -> int:
         font = self._get_font(font_path, size)
         ascent, descent = font.getmetrics()
-        return ascent + descent
+        metrics_height = ascent + descent
+        sample_bbox = font.getbbox("Ag")
+        bbox_height = sample_bbox[3] - sample_bbox[1] if sample_bbox else 0
+        return max(metrics_height, bbox_height)
+
+    def _get_line_height(self, font_path: str, size: int) -> int:
+        font_height = self._get_font_height(font_path, size)
+        scaled_height = int(math.ceil(font_height * self.line_spacing))
+        return max(font_height + 1, scaled_height)
+
+    def _fit_word_to_width(self, word: str, font_path: str, size: int, max_width: int) -> Tuple[str, int]:
+        """Fit a word into the available width by truncating when necessary."""
+        if max_width <= 0:
+            return "", 0
+
+        width = self._get_word_width(word, font_path, size)
+        if width <= max_width:
+            return word, width
+
+        truncated = word
+        while len(truncated) > 1 and self._get_word_width(truncated, font_path, size) > max_width:
+            truncated = truncated[:-1]
+
+        if not truncated:
+            return "", 0
+
+        # Optionally add a hyphen if it still fits.
+        if len(truncated) > 2:
+            hyphenated = truncated + "-"
+            hyphenated_width = self._get_word_width(hyphenated, font_path, size)
+            if hyphenated_width <= max_width:
+                return hyphenated, hyphenated_width
+
+        return truncated, self._get_word_width(truncated, font_path, size)
 
     def _split_paragraphs(self, text: str) -> List[List[str]]:
         paragraphs = re.split(r'\n\s*\n|\r\n\s*\r\n', text)
@@ -243,15 +316,6 @@ class DocumentGenerator:
             words = [w for w in words if w]
             if words:
                 result.append(words)
-
-        if len(result) <= 1 and result:
-            all_words = result[0]
-            result = []
-            i = 0
-            while i < len(all_words):
-                chunk_size = random.randint(15, 40)
-                result.append(all_words[i:i + chunk_size])
-                i += chunk_size
 
         return result
 
@@ -264,13 +328,19 @@ class DocumentGenerator:
         margin = int(canvas_w * self.margin_ratio)
         num_cols = self._current_num_columns
 
-        col_gap = int(canvas_w * 0.03) if num_cols > 1 else 0
+        col_gap = int(canvas_w * self._col_gap_ratio) if num_cols > 1 else 0
         total_col_width = canvas_w - 2 * margin - (num_cols - 1) * col_gap
         col_width = total_col_width // num_cols
+        layout_width = num_cols * col_width + (num_cols - 1) * col_gap
+
+        # Keep columns on-canvas even when random horizontal shift is sampled.
+        min_shift = -margin
+        max_shift = canvas_w - (margin + layout_width)
+        shift = int(max(min(self._current_h_shift, max_shift), min_shift))
 
         col_x_starts = []
         for c in range(num_cols):
-            col_x_starts.append(margin + c * (col_width + col_gap) + self._current_h_shift)
+            col_x_starts.append(margin + c * (col_width + col_gap) + shift)
 
         visible_words = []
         bboxes = []
@@ -282,9 +352,7 @@ class DocumentGenerator:
         y = margin
 
         body_font_size = self._current_font_size
-        body_font_height = self._get_font_height(self._current_font_path, body_font_size)
-        body_line_height = int(body_font_height * self.line_spacing)
-        space_width = self._get_word_width(" ", self._current_font_path, body_font_size)
+        body_line_height = self._get_line_height(self._current_font_path, body_font_size)
 
         for para_idx, para_words in enumerate(paragraphs):
             if not para_words:
@@ -299,7 +367,7 @@ class DocumentGenerator:
                 para_font_size = body_font_size
 
             para_font_height = self._get_font_height(self._current_font_path, para_font_size)
-            para_line_height = int(para_font_height * self.line_spacing)
+            para_line_height = self._get_line_height(self._current_font_path, para_font_size)
             para_space_width = self._get_word_width(" ", self._current_font_path, para_font_size)
 
             if is_title:
@@ -310,7 +378,8 @@ class DocumentGenerator:
                 indent = int(col_width * self._current_indent)
 
             if para_idx > 0:
-                y += int(body_line_height * (self._current_para_spacing - 1))
+                paragraph_gap = int(round(body_line_height * (self._current_para_spacing - 1.0)))
+                y += max(0, paragraph_gap)
 
             if y + para_font_height > canvas_h - margin:
                 current_col += 1
@@ -353,16 +422,33 @@ class DocumentGenerator:
                         x = x_start + indent
                         y = margin
 
-                if x + word_width < 0:
-                    x += word_width + para_space_width
+                col_end = col_x_starts[current_col] + col_width
+                available_width = col_end - x
+                render_word, render_width = self._fit_word_to_width(
+                    word,
+                    self._current_font_path,
+                    para_font_size,
+                    available_width,
+                )
+
+                if not render_word:
+                    x += para_space_width
+                    continue
+
+                if x + render_width < 0:
+                    x += render_width + para_space_width
                     continue
 
                 draw_x = max(0, x)
-                visible_words.append(word)
-                bboxes.append([draw_x, y, draw_x + word_width, y + para_font_height])
+                draw_x1 = min(canvas_w, x + render_width)
+                if draw_x1 <= draw_x:
+                    x += render_width + para_space_width
+                    continue
+                visible_words.append(render_word)
+                bboxes.append([draw_x, y, draw_x1, y + para_font_height])
                 font_info.append((self._current_font_path, para_font_size))
 
-                x += word_width + para_space_width
+                x += render_width + para_space_width
 
             if current_col >= num_cols:
                 break
@@ -407,19 +493,26 @@ class DocumentGenerator:
             draw.text((bbox[0], bbox[1]), word, font=font, fill=text_color)
 
         if self._needs_resize and self._current_canvas_size != self.output_size:
-            image = image.resize(self.output_size, Image.NEAREST)
+            image = image.resize(self.output_size, self._resize_resample)
 
         return image
 
     def _sample_parameters(self) -> None:
         self._current_font_path = random.choice(self._font_paths)
-        self._current_font_size = random.choice(self._body_font_sizes)
+        self._current_canvas_size = random.choices(
+            self._canvas_sizes,
+            weights=self._canvas_sample_weights,
+            k=1,
+        )[0]
 
-        while (self._current_font_path, self._current_font_size) not in self._fonts:
-            self._current_font_path = random.choice(self._font_paths)
-            self._current_font_size = random.choice(self._body_font_sizes)
+        # Font scaling can be made sublinear so larger pages render denser text after resize.
+        scale_x = self._current_canvas_size[0] / self.output_size[0]
+        scale_y = self._current_canvas_size[1] / self.output_size[1]
+        font_scale = max(scale_x, scale_y) ** self._font_scale_power
+        base_font_size = random.choice(self._body_font_sizes)
+        self._current_font_size = int(round(base_font_size * font_scale))
+        self._current_font_size = max(8, min(96, self._current_font_size))
 
-        self._current_canvas_size = random.choice(self._canvas_sizes)
         self._current_bg_color = self._sample_color(self._bg_color_config)
         self._current_text_color = self._sample_color(self._text_color_config)
 
@@ -427,7 +520,20 @@ class DocumentGenerator:
         shift_ratio = random.uniform(self._h_shift_range[0], self._h_shift_range[1])
         self._current_h_shift = int(canvas_w * shift_ratio)
 
-        self._current_num_columns = random.choice(self._num_columns_options)
+        # Prevent unreadable dense multi-column layouts at output resolution.
+        output_w = self.output_size[0]
+        output_margin = int(output_w * self.margin_ratio)
+        valid_cols = []
+        for cols in sorted(set(self._num_columns_options)):
+            out_gap = int(output_w * self._col_gap_ratio) if cols > 1 else 0
+            out_total_col_width = output_w - 2 * output_margin - (cols - 1) * out_gap
+            out_col_width = out_total_col_width // cols
+            if out_col_width >= self._min_output_column_width:
+                valid_cols.append(cols)
+        if not valid_cols:
+            valid_cols = [1]
+        weighted_valid_cols = [c for c in self._num_columns_options if c in valid_cols]
+        self._current_num_columns = random.choice(weighted_valid_cols)
         self._current_para_spacing = random.uniform(*self._para_spacing_range)
         self._current_indent = random.uniform(*self._indent_range)
 
